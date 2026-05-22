@@ -1,0 +1,2956 @@
+diff --git a/Makefile b/Makefile
+index e7b916e..0931c85 100644
+--- a/Makefile
++++ b/Makefile
+@@ -26,6 +26,7 @@ REPO           ?= higress
+ 
+ MANAGER_IMAGE        ?= $(REGISTRY)/$(REPO)/hiclaw-manager
+ MANAGER_COPAW_IMAGE  ?= $(REGISTRY)/$(REPO)/hiclaw-manager-copaw
++MANAGER_DROID_IMAGE  ?= $(REGISTRY)/$(REPO)/hiclaw-manager-droid
+ WORKER_IMAGE         ?= $(REGISTRY)/$(REPO)/hiclaw-worker
+ COPAW_WORKER_IMAGE   ?= $(REGISTRY)/$(REPO)/hiclaw-copaw-worker
+ HERMES_WORKER_IMAGE  ?= $(REGISTRY)/$(REPO)/hiclaw-hermes-worker
+@@ -35,6 +36,7 @@ EMBEDDED_IMAGE       ?= $(REGISTRY)/$(REPO)/hiclaw-embedded
+ 
+ MANAGER_TAG        ?= $(MANAGER_IMAGE):$(VERSION)
+ MANAGER_COPAW_TAG  ?= $(MANAGER_COPAW_IMAGE):$(VERSION)
++MANAGER_DROID_TAG  ?= $(MANAGER_DROID_IMAGE):$(VERSION)
+ WORKER_TAG         ?= $(WORKER_IMAGE):$(VERSION)
+ COPAW_WORKER_TAG   ?= $(COPAW_WORKER_IMAGE):$(VERSION)
+ HERMES_WORKER_TAG  ?= $(HERMES_WORKER_IMAGE):$(VERSION)
+@@ -157,6 +159,13 @@ build-manager-copaw: build-hiclaw-controller ## Build Manager CoPaw image (Pytho
+ 		-t $(LOCAL_MANAGER_COPAW) \
+ 		.
+ 
++build-manager-droid: ## Build Manager Droid image (Factory.ai CLI runtime)
++	@echo "==> Building Manager Droid image: $(MANAGER_DROID_TAG)"
++	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(DOCKER_BUILD_ARGS) \
++		-f droid-manager/Dockerfile \
++		-t $(MANAGER_DROID_TAG) \
++		droid-manager
++
+ build-embedded: build-hiclaw-controller ## Build embedded all-in-one controller image (infra + controller, no agent)
+ 	@echo "==> Building embedded image: $(LOCAL_EMBEDDED) (registry: $(HIGRESS_REGISTRY))"
+ 	docker build $(PLATFORM_FLAG) $(REGISTRY_ARG) $(DOCKER_BUILD_ARGS) \
+diff --git a/docs/droid-manager.md b/docs/droid-manager.md
+new file mode 100644
+index 0000000..5e15271
+--- /dev/null
++++ b/docs/droid-manager.md
+@@ -0,0 +1,174 @@
++# Droid Manager runtime
++
++The **Droid Manager** is a third Manager runtime for HiClaw, alongside the
++default OpenClaw (Node.js) and CoPaw (Python) harnesses. It replaces the
++Manager's brain with the [Factory.ai Droid CLI](https://docs.factory.ai/welcome)
++while keeping every other HiClaw contract intact — Workers, Matrix, Higress,
++MinIO, and the controller all behave exactly as before.
++
++## When to use it
++
++* You already pay for a Factory.ai subscription and want HiClaw Managers to
++  reuse your Droid models, skills, plugins, and MCP servers.
++* You want Factory's autonomy levels (`low|medium|high`), Mission mode, and
++  Spec mode as first-class Manager primitives.
++* You want to centralize Manager observability through Factory's session
++  tags + log groups.
++
++## How it works
++
++```
++Matrix room ─► MatrixChannel (matrix-nio)
++                       │
++                       ▼
++              DroidManager (asyncio)
++                       │
++                       ▼
++              DroidHarness  ─────────► droid exec
++                       │              --input-format stream-jsonrpc
++                       │              --output-format stream-jsonrpc
++                       │              --cwd /root/manager-workspace
++                       │
++                       ▼
++              Persistent session ids per room
++              under ~/.droid-manager/sessions/
++```
++
++Inbound Matrix messages are forwarded to `droid.add_user_message` over the
++JSON-RPC stream defined by [Droid Exec → stream-jsonrpc](https://docs.factory.ai/cli/droid-exec/overview).
++The manager pumps `droid.session_notification` events back into Matrix as
++markdown replies, refreshes the typing indicator every 25s while a turn is
++in flight, chunks responses longer than 16,000 characters, and persists the
++Droid session id so the same context is reused after a container restart.
++
++## Enabling the runtime
++
++### Local Docker (embedded controller)
++
++```bash
++hiclaw-install.sh \
++    --manager-runtime droid \
++    --droid-api-key "$FACTORY_API_KEY" \
++    --droid-model claude-sonnet-4-6 \
++    --droid-auto medium
++```
++
++### Helm
++
++```bash
++helm install hiclaw ./helm/hiclaw \
++    --set manager.runtime=droid \
++    --set manager.droid.apiKey=$FACTORY_API_KEY \
++    --set manager.droid.model=claude-sonnet-4-6 \
++    --set manager.droid.autoLevel=medium
++```
++
++### Environment variables
++
++| Variable                  | Purpose                                          |
++| ------------------------- | ------------------------------------------------ |
++| `HICLAW_MANAGER_RUNTIME`  | Set to `droid` to select this runtime            |
++| `FACTORY_API_KEY`         | Factory.ai API key (required)                    |
++| `HICLAW_DROID_MODEL`      | Override Droid model id                          |
++| `HICLAW_DROID_AUTO`       | Autonomy level (`low|medium|high`)               |
++| `HICLAW_DROID_REASONING`  | `off|none|low|medium|high`                       |
++| `HICLAW_DROID_LOG_GROUP`  | Factory log group id for session filtering       |
++| `HICLAW_DROID_UNSAFE`     | `1` to add `--skip-permissions-unsafe`           |
++| `HICLAW_DROID_CWD`        | Working directory passed to `droid exec --cwd`   |
++| `HICLAW_DROID_PROMPT_FILE`| File appended to the Droid system prompt         |
++
++### `openclaw.json` block
++
++The runtime reads the optional `runtime.droid` block from the same
++`openclaw.json` that the OpenClaw harness consumes:
++
++```jsonc
++{
++  "runtime": {
++    "droid": {
++      "model": "claude-sonnet-4-6",
++      "autoLevel": "medium",
++      "reasoningEffort": "medium",
++      "useSpec": false,
++      "mission": false,
++      "cwd": "/root/manager-workspace",
++      "appendSystemPromptFile": "/root/manager-workspace/SOUL.md",
++      "enabledTools": [],
++      "disabledTools": [],
++      "tags": ["hiclaw", "manager"],
++      "logGroupId": "hiclaw-manager",
++      "sessionDir": "/root/.droid-manager/sessions",
++      "stallTimeoutSeconds": 1800
++    }
++  }
++}
++```
++
++## Permissions & autonomy
++
++Droid runs by default in **Spec mode** (read-only). The Droid Manager opts
++into mutating operations via `--auto medium` (matches the OpenClaw / CoPaw
++default of `tools.exec.security="full"`).
++
++When Droid asks for an above-autonomy permission, the Manager's default
++resolver denies the request and surfaces the prompt in the container log.
++Wire your own approval flow by subclassing `DroidManager` and overriding
++`_resolve_permission`:
++
++```python
++from droid_manager.manager import DroidManager
++
++class ApprovingManager(DroidManager):
++    async def _resolve_permission(self, params):
++        # Forward to the admin via a Matrix DM, Slack message, etc.
++        granted = await ask_admin_via_matrix(params)
++        return {"granted": granted}
++```
++
++## Sessions
++
++Each Matrix room / DM gets its own persistent Droid session under
++`~/.droid-manager/sessions/<safe_room_id>.json`. After a container restart,
++the manager calls `droid.load_session` with the saved id so the agent
++continues exactly where it left off. Reset a single room's context by
++deleting that JSON file (or by sending `/reset` once we wire that through).
++
++## Observability
++
++Every Droid session is tagged with `hiclaw` + `manager` and attached to
++the `hiclaw-manager` log group by default (overridable via `tags` and
++`logGroupId` in the config). That makes Manager activity searchable in the
++Factory dashboard alongside any other Droid sessions you run elsewhere.
++
++## Limitations
++
++* Currently the Manager runs one Droid session per room. Cross-room context
++  is not shared — by design, mirroring OpenClaw's `dmScope: per-channel-peer`.
++* The Worker runtimes (OpenClaw / CoPaw / Hermes) are unchanged. Droid
++  Workers would be a future addition and would live under a sibling
++  `droid-worker` package.
++* Image, audio, and video uploads from Matrix are not yet routed into
++  `droid.add_user_message` attachments — text only for now.
++* `droid.fork_session` is wired but not used by default; future work will
++  let the Manager fan-out exploratory branches without polluting the main
++  room session.
++
++## Troubleshooting
++
++`droid binary 'droid' not found on PATH`
++:   The image build did not run `scripts/install-droid-cli.sh`. Re-run the
++    image build, or shell into the container and install manually:
++    `npm install -g droid`.
++
++`FACTORY_API_KEY is unset`
++:   Generate a key at `app.factory.ai/settings/api-keys` and inject it via
++    `--droid-api-key` (installer) or the `HICLAW_DROID_API_KEY` env var.
++
++`droid harness exited (code=2)`
++:   Exit code 2 is "invalid CLI arguments". Check the resolved invocation
++    that the start script logs (`Spawning droid harness: droid exec …`).
++
++`turn never completes`
++:   The harness uses a 120s per-request timeout and surfaces an error event
++    that the Manager replies with as `⚠️ droid error: …`. Raise
++    `stallTimeoutSeconds` in the config block for long missions.
+diff --git a/droid-manager/Dockerfile b/droid-manager/Dockerfile
+new file mode 100644
+index 0000000..e6f0eb9
+--- /dev/null
++++ b/droid-manager/Dockerfile
+@@ -0,0 +1,80 @@
++# ============================================================
++# HiClaw Manager — Droid Runtime
++# ============================================================
++# Lightweight Python image with the Factory.ai Droid CLI baked in, plus the
++# matrix-nio[e2e] runtime needed to bridge Matrix to droid exec.
++#
++# This image is the equivalent of hiclaw-manager-copaw, but for the Droid
++# Factory CLI runtime. It is wired into the HiClaw Manager when
++# HICLAW_MANAGER_RUNTIME=droid (see start-manager-agent.sh).
++#
++# Build args mirror the other HiClaw images:
++#   HIGRESS_REGISTRY  - base image registry (default: cn-hangzhou)
++#   APT_MIRROR        - APT mirror host (default: empty)
++#   DROID_VERSION     - droid CLI version pin (default: latest)
++# ============================================================
++
++ARG HIGRESS_REGISTRY=higress-registry.cn-hangzhou.cr.aliyuncs.com
++FROM ${HIGRESS_REGISTRY}/higress/ubuntu:24.04
++
++ARG APT_MIRROR=
++ARG DROID_VERSION=latest
++ARG HTTP_PROXY
++ARG HTTPS_PROXY
++
++ENV HTTP_PROXY=${HTTP_PROXY} \
++    HTTPS_PROXY=${HTTPS_PROXY} \
++    DEBIAN_FRONTEND=noninteractive
++
++RUN if [ -n "${APT_MIRROR}" ]; then \
++        for _src in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
++            [ -f "${_src}" ] && sed -i \
++                "s|archive.ubuntu.com|${APT_MIRROR}|g; \
++                 s|security.ubuntu.com|${APT_MIRROR}|g; \
++                 s|ports.ubuntu.com|${APT_MIRROR}|g" "${_src}" || true; \
++        done; \
++    fi && \
++    apt-get update && apt-get install -y --no-install-recommends \
++        python3 python3-pip python3-venv \
++        curl ca-certificates jq gettext-base \
++        git openssh-client procps tzdata \
++        libolm3 \
++    && rm -rf /var/lib/apt/lists/*
++
++# Install Node.js 22 — needed for `npm install -g droid` (smaller than the
++# curl-piped installer and lets us pin DROID_VERSION).
++RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
++    apt-get install -y --no-install-recommends nodejs && \
++    rm -rf /var/lib/apt/lists/*
++
++# Install the Factory CLI
++ARG DROID_VERSION
++ENV DROID_VERSION=${DROID_VERSION}
++COPY scripts/install-droid-cli.sh /usr/local/bin/install-droid-cli.sh
++RUN chmod +x /usr/local/bin/install-droid-cli.sh && /usr/local/bin/install-droid-cli.sh
++
++# Copy the droid-manager Python package
++WORKDIR /opt/hiclaw/droid-manager
++COPY pyproject.toml README.md ./
++COPY src ./src
++COPY scripts ./scripts
++
++# Install droid-manager and its runtime deps
++RUN python3 -m pip install --no-cache-dir --break-system-packages \
++        ".[test]"==0.1.0 || \
++    python3 -m pip install --no-cache-dir --break-system-packages "."
++
++# Symlinks so supervisord can call our scripts on the canonical paths.
++RUN install -m 0755 scripts/start-droid-manager.sh \
++        /opt/hiclaw/scripts/init/start-droid-manager.sh && \
++    chmod +x /opt/hiclaw/scripts/init/start-droid-manager.sh
++
++ENV PYTHONUNBUFFERED=1 \
++    PYTHONPATH=/opt/hiclaw/droid-manager/src \
++    HICLAW_MANAGER_RUNTIME=droid
++
++# Clear build-only proxy env so curl in the container talks to localhost
++# directly at runtime.
++ENV HTTP_PROXY= HTTPS_PROXY=
++
++ENTRYPOINT ["/opt/hiclaw/scripts/init/start-droid-manager.sh"]
+diff --git a/droid-manager/README.md b/droid-manager/README.md
+new file mode 100644
+index 0000000..8dd4e29
+--- /dev/null
++++ b/droid-manager/README.md
+@@ -0,0 +1,156 @@
++# droid-manager
++
++**Droid Factory CLI runtime for the HiClaw Manager** — a drop-in replacement for the
++OpenClaw / CoPaw harnesses that drives the Manager loop with
++[Factory.ai Droid CLI](https://docs.factory.ai/welcome) via its `droid exec`
++JSON-RPC streaming protocol.
++
++It plugs into HiClaw the same way `copaw-worker` does:
++
++```text
++HICLAW_MANAGER_RUNTIME=droid  →  start-manager-agent.sh → start-droid-manager.sh
++                                                                 │
++                                                                 ▼
++                                            MatrixChannel (matrix-nio)
++                                                                 │
++                                                                 ▼
++                                            DroidHarness ── stdin/stdout ──▶
++                                            `droid exec --input-format stream-jsonrpc
++                                                        --output-format stream-jsonrpc`
++```
++
++The harness implements the JSON-RPC vocabulary documented in
++[Droid Exec → stdin/stdout behavior for raw JSON-RPC](https://docs.factory.ai/cli/droid-exec/overview):
++
++| Direction                  | Method                          | Purpose                                      |
++| -------------------------- | ------------------------------- | -------------------------------------------- |
++| client → droid (request)   | `droid.initialize_session`      | Open or attach a session for a Matrix room   |
++| client → droid (request)   | `droid.load_session`            | Resume an existing session by id             |
++| client → droid (request)   | `droid.add_user_message`        | Forward a Matrix message into the agent      |
++| droid → client (notify)    | `droid.session_notification`    | Stream assistant deltas, tool events, errors |
++| droid → client (request)   | `droid.request_permission`      | Approval prompt for risky tool calls         |
++| droid → client (request)   | `droid.ask_user`                | Out-of-band question for the user            |
++
++The bridge maps each Matrix room (or DM) to a **persistent droid session**, persists
++the session id under `${HOME}/.droid-manager/sessions/<room>.json`, and reconnects
++seamlessly across container restarts.
++
++## Why it exists
++
++HiClaw's stock Manager runs `openclaw gateway run` — a Node.js gateway with a
++built-in `@matrix-org/matrix-sdk-crypto-nodejs` native addon and its own model
++gateway. We replace just the *harness layer* while keeping every other HiClaw
++contract intact:
++
++- Matrix homeserver / token / E2EE flags are read from `openclaw.json` (same file).
++- Allowlist / `requireMention` / `groups{}` policy is preserved verbatim.
++- The Manager's filesystem layout (`~/manager-workspace`, `SOUL.md`,
++  `HEARTBEAT.md`, `TOOLS.md`, `skills/`, `memory/`, `hiclaw-fs/`) is the working
++  directory passed to `droid exec --cwd`.
++- The Manager continues to assign work via Matrix to existing OpenClaw / CoPaw /
++  Hermes **Workers**. Only the Manager's brain changes.
++
++## Quick start (local Docker)
++
++```bash
++# 1. Build the manager-droid image
++make manager-droid
++
++# 2. Bring up the embedded stack with the droid runtime
++hiclaw-install.sh \
++    --manager-runtime droid \
++    --droid-api-key "$FACTORY_API_KEY" \
++    --droid-model "claude-sonnet-4-6" \
++    --droid-auto medium
++```
++
++## Quick start (Helm)
++
++```bash
++helm install hiclaw ./helm/hiclaw \
++    --set manager.runtime=droid \
++    --set manager.droid.apiKey=$FACTORY_API_KEY \
++    --set manager.droid.model=claude-sonnet-4-6 \
++    --set manager.droid.autoLevel=medium
++```
++
++## Configuration
++
++`droid-manager` reads the **same** `openclaw.json` the OpenClaw harness reads.
++A new optional section `runtime.droid` controls Droid-specific behavior:
++
++```jsonc
++{
++  "runtime": {
++    "droid": {
++      "binary": "droid",                          // override path
++      "model": "claude-sonnet-4-6",               // -m
++      "specModel": "claude-haiku-4-5",            // --spec-model
++      "reasoningEffort": "medium",                // -r
++      "autoLevel": "medium",                      // --auto low|medium|high
++      "mission": false,                           // --mission
++      "appendSystemPromptFile": "/root/manager-workspace/SOUL.md",
++      "cwd": "/root/manager-workspace",           // --cwd
++      "enabledTools": [],                         // --enabled-tools
++      "disabledTools": [],
++      "tags": ["hiclaw", "manager"],              // --tag (repeatable)
++      "logGroupId": "hiclaw-manager",
++      "skipPermissionsUnsafe": false,
++      "sessionDir": "~/.droid-manager/sessions",
++      "stallTimeoutSeconds": 1800
++    }
++  }
++}
++```
++
++Required environment variable: `FACTORY_API_KEY` (the harness exports it before
++spawning `droid exec`).
++
++## Architecture
++
++```
++                ┌────────────────────────────────────────────────┐
++                │              HiClaw Manager container          │
++                │                                                │
++   Matrix ─────►│  MatrixChannel  ────────►  DroidHarness  ───── │ ─► droid exec
++   (Tuwunel)    │  (matrix-nio)              (stream-jsonrpc)    │    (one subprocess
++                │                                                │     per session*)
++                │  openclaw.json reader  ───►  DroidConfig       │
++                │  Manager workspace      ───►  --cwd, SOUL.md   │
++                └────────────────────────────────────────────────┘
++```
++
++\* You can run one `droid exec` process per room (default, isolated context) or a
++single process multiplexed across rooms via `droid.fork`. The default is per-room.
++
++## Layout
++
++```
++droid-manager/
++├── pyproject.toml
++├── README.md
++├── Dockerfile
++├── scripts/
++│   ├── start-droid-manager.sh   # called by start-manager-agent.sh when runtime=droid
++│   └── install-droid-cli.sh     # install Factory CLI in the image
++├── src/
++│   └── droid_manager/
++│       ├── __init__.py
++│       ├── __main__.py          # python -m droid_manager
++│       ├── bridge.py            # openclaw.json -> droid runtime config
++│       ├── config.py            # DroidConfig dataclass
++│       ├── harness.py           # subprocess + JSON-RPC stream wrapper
++│       ├── matrix_channel.py    # thin wrapper over copaw matrix channel
++│       ├── manager.py           # main loop: Matrix <-> Harness routing
++│       ├── session_store.py     # per-room session id persistence
++│       └── templates/
++│           └── runtime.droid.json
++└── tests/
++    ├── test_config.py
++    ├── test_harness.py
++    └── test_session_store.py
++```
++
++## License
++
++Apache-2.0, inherits from HiClaw.
+diff --git a/droid-manager/pyproject.toml b/droid-manager/pyproject.toml
+new file mode 100644
+index 0000000..54115ab
+--- /dev/null
++++ b/droid-manager/pyproject.toml
+@@ -0,0 +1,37 @@
++[build-system]
++requires = ["setuptools>=61.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "droid-manager"
++version = "0.1.0"
++description = "Factory.ai Droid CLI runtime for the HiClaw Manager"
++readme = "README.md"
++license = { text = "Apache-2.0" }
++requires-python = ">=3.10"
++dependencies = [
++    "matrix-nio[e2e]>=0.24.0",
++    "httpx>=0.27",
++    "markdown-it-py>=3.0",
++    "linkify-it-py>=2.0",
++    "pyyaml>=6.0",
++]
++
++[project.optional-dependencies]
++test = ["pytest>=8", "pytest-asyncio>=0.23"]
++
++[project.urls]
++Homepage = "https://github.com/agentscope-ai/HiClaw"
++Repository = "https://github.com/agentscope-ai/HiClaw"
++
++[project.scripts]
++droid-manager = "droid_manager.__main__:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
++
++[tool.setuptools.package-data]
++droid_manager = ["templates/*.json"]
++
++[tool.pytest.ini_options]
++asyncio_mode = "auto"
+diff --git a/droid-manager/scripts/install-droid-cli.sh b/droid-manager/scripts/install-droid-cli.sh
+new file mode 100644
+index 0000000..f55ac5e
+--- /dev/null
++++ b/droid-manager/scripts/install-droid-cli.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++# install-droid-cli.sh — Install the Factory.ai Droid CLI inside the Manager
++# image. Called from droid-manager/Dockerfile and the embedded controller.
++#
++# Source of truth for the install command:
++# https://docs.factory.ai/cli/getting-started/quickstart
++#
++# We prefer the npm install for image builds because it avoids piping a
++# remote shell script into bash and gives us a pinnable version.
++set -euo pipefail
++
++DROID_VERSION="${DROID_VERSION:-latest}"
++
++if command -v droid >/dev/null 2>&1; then
++    echo "droid already installed: $(droid --version 2>&1 || true)"
++    exit 0
++fi
++
++if command -v npm >/dev/null 2>&1; then
++    echo "==> Installing droid via npm ($DROID_VERSION)..."
++    npm install -g "droid@${DROID_VERSION}" --no-fund --no-audit
++elif command -v curl >/dev/null 2>&1; then
++    echo "==> Installing droid via Factory CLI install script..."
++    curl -fsSL https://app.factory.ai/cli | sh
++    # The installer drops the binary under ~/.factory/bin; ensure it's on PATH.
++    if [ -d "$HOME/.factory/bin" ] && ! command -v droid >/dev/null 2>&1; then
++        ln -sf "$HOME/.factory/bin/droid" /usr/local/bin/droid
++    fi
++else
++    echo "ERROR: neither npm nor curl available to install droid CLI" >&2
++    exit 1
++fi
++
++droid --version || {
++    echo "ERROR: droid did not install correctly" >&2
++    exit 1
++}
+diff --git a/droid-manager/scripts/start-droid-manager.sh b/droid-manager/scripts/start-droid-manager.sh
+new file mode 100644
+index 0000000..c5ad227
+--- /dev/null
++++ b/droid-manager/scripts/start-droid-manager.sh
+@@ -0,0 +1,97 @@
++#!/bin/bash
++# start-droid-manager.sh — Start the Manager Agent with the Droid runtime.
++# Called by start-manager-agent.sh when HICLAW_MANAGER_RUNTIME=droid.
++#
++# Mirrors start-copaw-manager.sh: bridge openclaw.json into a runtime-specific
++# working directory, then exec the long-running runtime as PID 1 of its
++# supervisord program.
++
++set -euo pipefail
++
++# Pull in the same env helpers as the other start scripts.
++if [ -f /opt/hiclaw/scripts/lib/hiclaw-env.sh ]; then
++    # shellcheck disable=SC1091
++    source /opt/hiclaw/scripts/lib/hiclaw-env.sh
++else
++    # Fallback log shim when running outside the HiClaw image.
++    log() { printf "%s [droid-manager] %s\n" "$(date -u +%FT%TZ)" "$*"; }
++fi
++
++OPENCLAW_WORKSPACE="${HOME:-/root/manager-workspace}"
++OPENCLAW_JSON="${OPENCLAW_WORKSPACE}/openclaw.json"
++DROID_WORKING_DIR="${HOME}/.droid-manager"
++
++if [ ! -f "${OPENCLAW_JSON}" ]; then
++    log "ERROR: openclaw.json not found at ${OPENCLAW_JSON}"
++    exit 1
++fi
++
++mkdir -p "${DROID_WORKING_DIR}/sessions"
++
++# ---- 1. Verify Factory API key ----------------------------------------------
++if [ -z "${FACTORY_API_KEY:-}" ]; then
++    log "WARNING: FACTORY_API_KEY is unset. The droid CLI will fail to call"
++    log "         Factory's gateway. Generate a key at"
++    log "         https://app.factory.ai/settings/api-keys and export it via"
++    log "         HICLAW_DROID_API_KEY or FACTORY_API_KEY."
++fi
++if [ -n "${HICLAW_DROID_API_KEY:-}" ] && [ -z "${FACTORY_API_KEY:-}" ]; then
++    export FACTORY_API_KEY="${HICLAW_DROID_API_KEY}"
++fi
++
++# ---- 2. Verify droid binary is on PATH --------------------------------------
++if ! command -v droid >/dev/null 2>&1; then
++    log "ERROR: droid CLI not found on PATH."
++    log "       Run scripts/install-droid-cli.sh during image build."
++    exit 1
++fi
++DROID_VERSION="$(droid --version 2>&1 | head -1 || true)"
++log "droid binary: $(command -v droid) (${DROID_VERSION})"
++
++# ---- 3. Bridge openclaw.json into runtime.droid.json (debug aid) ------------
++log "Bridging openclaw.json -> droid runtime config..."
++PYTHONPATH="/opt/hiclaw/droid-manager/src:${PYTHONPATH:-}" \
++    python3 -m droid_manager.bridge \
++        --openclaw-json "${OPENCLAW_JSON}" \
++        --working-dir "${DROID_WORKING_DIR}" || {
++    log "bridge step failed; manager will still try to start from openclaw.json"
++}
++
++# ---- 4. Sync prompt files into the droid cwd --------------------------------
++# Same convention as start-copaw-manager.sh: AGENTS.md, SOUL.md, HEARTBEAT.md,
++# TOOLS.md, USER.md, MEMORY.md, plus memory/ and skills/ are kept under the
++# Manager workspace and exposed to droid via --cwd.
++for _f in AGENTS.md SOUL.md HEARTBEAT.md TOOLS.md USER.md MEMORY.md; do
++    [ -f "${OPENCLAW_WORKSPACE}/${_f}" ] || continue
++    # files already live in cwd; no-op but log presence
++    log "  prompt asset present: ${_f}"
++done
++
++# ---- 5. Background watcher: re-bridge when openclaw.json changes ------------
++(
++    _prev=$(md5sum "${OPENCLAW_JSON}" 2>/dev/null | awk '{print $1}')
++    while true; do
++        sleep 60
++        _curr=$(md5sum "${OPENCLAW_JSON}" 2>/dev/null | awk '{print $1}')
++        if [ -n "${_curr}" ] && [ "${_curr}" != "${_prev}" ]; then
++            log "openclaw.json changed, re-bridging..."
++            PYTHONPATH="/opt/hiclaw/droid-manager/src:${PYTHONPATH:-}" \
++                python3 -m droid_manager.bridge \
++                    --openclaw-json "${OPENCLAW_JSON}" \
++                    --working-dir "${DROID_WORKING_DIR}" >/dev/null 2>&1 || true
++            _prev="${_curr}"
++        fi
++    done
++) &
++WATCHER_PID=$!
++log "openclaw.json watcher started (pid=${WATCHER_PID})"
++
++# ---- 6. Launch the Droid Manager --------------------------------------------
++export OPENCLAW_CONFIG_PATH="${OPENCLAW_JSON}"
++export DROID_MANAGER_WORKING_DIR="${DROID_WORKING_DIR}"
++export PYTHONPATH="/opt/hiclaw/droid-manager/src:${PYTHONPATH:-}"
++
++log "Starting droid-manager runtime..."
++exec python3 -m droid_manager \
++    --openclaw-json "${OPENCLAW_JSON}" \
++    --log-level "${DROID_MANAGER_LOG_LEVEL:-INFO}"
+diff --git a/droid-manager/src/droid_manager/__init__.py b/droid-manager/src/droid_manager/__init__.py
+new file mode 100644
+index 0000000..61e6c0b
+--- /dev/null
++++ b/droid-manager/src/droid_manager/__init__.py
+@@ -0,0 +1,34 @@
++"""Droid Factory CLI runtime for the HiClaw Manager.
++
++A drop-in replacement for the OpenClaw harness that drives the Manager loop
++with ``droid exec --input-format stream-jsonrpc --output-format stream-jsonrpc``.
++"""
++
++from .config import DroidConfig, MatrixSettings, RuntimeConfig
++from .harness import DroidHarness, HarnessEvent, HarnessRequest
++from .session_store import SessionStore
++
++# Note: ``DroidManager`` is imported lazily because it depends on
++# ``matrix-nio`` (which depends on libolm for E2EE). Importing the package
++# in test or tooling environments without those deps should still work.
++
++
++def __getattr__(name):  # pragma: no cover - thin attribute proxy
++    if name == "DroidManager":
++        from .manager import DroidManager as _DroidManager
++        return _DroidManager
++    raise AttributeError(f"module 'droid_manager' has no attribute {name!r}")
++
++
++__all__ = [
++    "DroidConfig",
++    "DroidHarness",
++    "DroidManager",
++    "HarnessEvent",
++    "HarnessRequest",
++    "MatrixSettings",
++    "RuntimeConfig",
++    "SessionStore",
++]
++
++__version__ = "0.1.0"
+diff --git a/droid-manager/src/droid_manager/__main__.py b/droid-manager/src/droid_manager/__main__.py
+new file mode 100644
+index 0000000..051a912
+--- /dev/null
++++ b/droid-manager/src/droid_manager/__main__.py
+@@ -0,0 +1,52 @@
++"""``python -m droid_manager`` entrypoint.
++
++Usage::
++
++    droid-manager [--openclaw-json PATH] [--log-level LEVEL]
++
++If ``--openclaw-json`` is omitted, the manager reads ``OPENCLAW_CONFIG_PATH``
++(set by ``start-manager-agent.sh``) or falls back to
++``~/manager-workspace/openclaw.json``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import logging
++import os
++import sys
++
++from .manager import DEFAULT_OPENCLAW_JSON, run
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(prog="droid-manager")
++    parser.add_argument(
++        "--openclaw-json",
++        default=os.environ.get("OPENCLAW_CONFIG_PATH") or DEFAULT_OPENCLAW_JSON,
++        help="Path to the HiClaw openclaw.json configuration file.",
++    )
++    parser.add_argument(
++        "--log-level",
++        default=os.environ.get("DROID_MANAGER_LOG_LEVEL", "INFO"),
++        help="Python logging level (default: INFO).",
++    )
++    args = parser.parse_args(argv)
++
++    logging.basicConfig(
++        level=args.log_level.upper(),
++        format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
++        datefmt="%H:%M:%S",
++    )
++    try:
++        run(args.openclaw_json)
++    except KeyboardInterrupt:
++        return 130
++    except Exception as exc:
++        logging.getLogger("droid_manager").exception("fatal: %s", exc)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":  # pragma: no cover
++    sys.exit(main())
+diff --git a/droid-manager/src/droid_manager/bridge.py b/droid-manager/src/droid_manager/bridge.py
+new file mode 100644
+index 0000000..6921a24
+--- /dev/null
++++ b/droid-manager/src/droid_manager/bridge.py
+@@ -0,0 +1,72 @@
++"""Bridge legacy openclaw.json into a droid-manager runtime layout.
++
++Mirrors ``copaw_worker.bridge`` so the start script can call::
++
++    python3 -m droid_manager.bridge \
++        --openclaw-json /root/manager-workspace/openclaw.json \
++        --working-dir /root/.droid-manager
++
++The bridge produces:
++
++    <working_dir>/runtime.droid.json   — the resolved DroidConfig as JSON
++    <working_dir>/runtime.matrix.json  — the resolved MatrixSettings as JSON
++    <working_dir>/sessions/            — directory for session-id persistence
++
++These artifacts are not required at runtime (the manager re-reads
++openclaw.json on boot), but they are useful for debugging and for tooling
++that wants to inspect the resolved configuration without running the manager.
++"""
++
++from __future__ import annotations
++
++import argparse
++import dataclasses
++import json
++import os
++import sys
++from pathlib import Path
++
++from .config import RuntimeConfig
++
++
++def _to_json(obj: object) -> object:
++    if dataclasses.is_dataclass(obj):
++        return {
++            k: _to_json(v) for k, v in dataclasses.asdict(obj).items()
++        }
++    if isinstance(obj, Path):
++        return str(obj)
++    if isinstance(obj, (list, tuple)):
++        return [_to_json(v) for v in obj]
++    if isinstance(obj, dict):
++        return {k: _to_json(v) for k, v in obj.items()}
++    return obj
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(prog="droid_manager.bridge")
++    parser.add_argument("--openclaw-json", required=True)
++    parser.add_argument("--working-dir", required=True)
++    parser.add_argument("--profile", default="manager", choices=["manager"])
++    args = parser.parse_args(argv)
++
++    working = Path(os.path.expandvars(os.path.expanduser(args.working_dir)))
++    working.mkdir(parents=True, exist_ok=True)
++    (working / "sessions").mkdir(parents=True, exist_ok=True)
++
++    config = RuntimeConfig.load(args.openclaw_json)
++    (working / "runtime.droid.json").write_text(
++        json.dumps(_to_json(config.droid), indent=2), encoding="utf-8"
++    )
++    (working / "runtime.matrix.json").write_text(
++        json.dumps(_to_json(config.matrix), indent=2), encoding="utf-8"
++    )
++    print(
++        f"bridged {args.openclaw_json} -> {working}/runtime.{{droid,matrix}}.json",
++        file=sys.stderr,
++    )
++    return 0
++
++
++if __name__ == "__main__":  # pragma: no cover
++    sys.exit(main())
+diff --git a/droid-manager/src/droid_manager/config.py b/droid-manager/src/droid_manager/config.py
+new file mode 100644
+index 0000000..61e606d
+--- /dev/null
++++ b/droid-manager/src/droid_manager/config.py
+@@ -0,0 +1,263 @@
++"""Configuration loader for the Droid Manager.
++
++Reads the existing HiClaw ``openclaw.json`` template (the same file the
++OpenClaw and CoPaw harnesses consume) and extracts:
++
++* The Matrix channel settings (homeserver, access token, allowlist, etc.).
++* The Droid-specific runtime block at ``runtime.droid`` (optional).
++
++This means a stock HiClaw install needs **no schema change** to switch to
++the Droid harness — operators just set ``HICLAW_MANAGER_RUNTIME=droid`` and
++optionally drop a ``runtime.droid`` block into their config.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Iterable
++
++DEFAULT_BINARY = "droid"
++DEFAULT_AUTO_LEVEL = "medium"
++DEFAULT_REASONING = "medium"
++DEFAULT_STALL_TIMEOUT = 1800  # seconds — match openclaw timeoutSeconds default
++DEFAULT_SESSION_DIR = "~/.droid-manager/sessions"
++
++
++def _expand(path: str | os.PathLike[str]) -> Path:
++    """Expand ``~`` and environment variables in a path."""
++    return Path(os.path.expandvars(os.path.expanduser(str(path))))
++
++
++def _as_list(value: Any) -> list[str]:
++    """Coerce a JSON value to ``list[str]`` (drops ``None`` and empties)."""
++    if value is None:
++        return []
++    if isinstance(value, str):
++        return [value] if value else []
++    if isinstance(value, Iterable):
++        return [str(v) for v in value if str(v)]
++    return [str(value)]
++
++
++@dataclass
++class MatrixSettings:
++    """Subset of ``channels.matrix`` we need to drive matrix-nio."""
++
++    homeserver: str = ""
++    access_token: str = ""
++    user_id: str = ""
++    encryption: bool = False
++
++    dm_policy: str = "allowlist"
++    allow_from: list[str] = field(default_factory=list)
++    group_policy: str = "allowlist"
++    group_allow_from: list[str] = field(default_factory=list)
++    groups: dict[str, Any] = field(default_factory=dict)
++    auto_join: str = "always"
++
++    sync_timeout_ms: int = 30_000
++    history_limit: int = 50
++
++    @classmethod
++    def from_openclaw(cls, raw: dict[str, Any]) -> "MatrixSettings":
++        """Map ``openclaw.json:channels.matrix`` onto our dataclass."""
++        m = (raw.get("channels") or {}).get("matrix") or {}
++        # OpenClaw uses ``accessToken`` (camelCase) while copaw bridge writes
++        # ``access_token`` (snake_case). Accept either to stay drop-in.
++        token = m.get("accessToken") or m.get("access_token") or ""
++        return cls(
++            homeserver=m.get("homeserver", ""),
++            access_token=token,
++            user_id=m.get("userId") or m.get("user_id") or "",
++            encryption=bool(m.get("encryption", False)),
++            dm_policy=(m.get("dm") or {}).get("policy", "allowlist"),
++            allow_from=_as_list((m.get("dm") or {}).get("allowFrom")),
++            group_policy=m.get("groupPolicy", "allowlist"),
++            group_allow_from=_as_list(m.get("groupAllowFrom")),
++            groups=m.get("groups") or {},
++            auto_join=m.get("autoJoin", "always"),
++            sync_timeout_ms=int(m.get("syncTimeoutMs", 30_000)),
++            history_limit=int(m.get("historyLimit", 50)),
++        )
++
++
++@dataclass
++class DroidConfig:
++    """Droid CLI invocation settings (one harness ≅ one ``droid exec`` proc)."""
++
++    binary: str = DEFAULT_BINARY
++    model: str | None = None
++    spec_model: str | None = None
++    reasoning_effort: str = DEFAULT_REASONING
++    spec_reasoning_effort: str | None = None
++    auto_level: str = DEFAULT_AUTO_LEVEL
++    use_spec: bool = False
++    mission: bool = False
++    worker_model: str | None = None
++    worker_reasoning_effort: str | None = None
++    validator_model: str | None = None
++    validator_reasoning_effort: str | None = None
++
++    cwd: Path = field(default_factory=lambda: _expand("~"))
++    append_system_prompt_file: Path | None = None
++    append_system_prompt: str | None = None
++    enabled_tools: list[str] = field(default_factory=list)
++    disabled_tools: list[str] = field(default_factory=list)
++    tags: list[str] = field(default_factory=list)
++    log_group_id: str | None = None
++    skip_permissions_unsafe: bool = False
++
++    session_dir: Path = field(default_factory=lambda: _expand(DEFAULT_SESSION_DIR))
++    stall_timeout_seconds: int = DEFAULT_STALL_TIMEOUT
++    api_key_env: str = "FACTORY_API_KEY"
++
++    @classmethod
++    def from_openclaw(cls, raw: dict[str, Any]) -> "DroidConfig":
++        """Read the optional ``runtime.droid`` block from ``openclaw.json``.
++
++        Missing keys fall back to environment overrides (``HICLAW_DROID_*``)
++        and then to sensible defaults. This means a stock OpenClaw config
++        with no droid section still produces a runnable harness.
++        """
++        env = os.environ
++        runtime = (raw.get("runtime") or {}).get("droid") or {}
++
++        def _env(name: str, default: Any = None) -> Any:
++            return env.get(name, default)
++
++        cwd_raw = runtime.get("cwd") or _env("HICLAW_DROID_CWD") or "~/manager-workspace"
++        prompt_path = runtime.get("appendSystemPromptFile") or _env(
++            "HICLAW_DROID_PROMPT_FILE"
++        )
++        # Default to ``SOUL.md`` under cwd so the Manager keeps its prompt.
++        if not prompt_path:
++            soul = _expand(cwd_raw) / "SOUL.md"
++            if soul.is_file():
++                prompt_path = str(soul)
++
++        session_dir_raw = runtime.get("sessionDir") or _env(
++            "HICLAW_DROID_SESSION_DIR", DEFAULT_SESSION_DIR
++        )
++
++        return cls(
++            binary=runtime.get("binary") or _env("HICLAW_DROID_BIN", DEFAULT_BINARY),
++            model=runtime.get("model") or _env("HICLAW_DROID_MODEL"),
++            spec_model=runtime.get("specModel") or _env("HICLAW_DROID_SPEC_MODEL"),
++            reasoning_effort=(
++                runtime.get("reasoningEffort")
++                or _env("HICLAW_DROID_REASONING", DEFAULT_REASONING)
++            ),
++            spec_reasoning_effort=runtime.get("specReasoningEffort"),
++            auto_level=(
++                runtime.get("autoLevel")
++                or _env("HICLAW_DROID_AUTO", DEFAULT_AUTO_LEVEL)
++            ),
++            use_spec=bool(runtime.get("useSpec", False)),
++            mission=bool(runtime.get("mission", False)),
++            worker_model=runtime.get("workerModel"),
++            worker_reasoning_effort=runtime.get("workerReasoningEffort"),
++            validator_model=runtime.get("validatorModel"),
++            validator_reasoning_effort=runtime.get("validatorReasoningEffort"),
++            cwd=_expand(cwd_raw),
++            append_system_prompt_file=_expand(prompt_path) if prompt_path else None,
++            append_system_prompt=runtime.get("appendSystemPrompt"),
++            enabled_tools=_as_list(runtime.get("enabledTools")),
++            disabled_tools=_as_list(runtime.get("disabledTools")),
++            tags=_as_list(runtime.get("tags")) or ["hiclaw", "manager"],
++            log_group_id=runtime.get("logGroupId") or _env("HICLAW_DROID_LOG_GROUP"),
++            skip_permissions_unsafe=bool(
++                runtime.get("skipPermissionsUnsafe", False)
++                or _env("HICLAW_DROID_UNSAFE") == "1"
++            ),
++            session_dir=_expand(session_dir_raw),
++            stall_timeout_seconds=int(
++                runtime.get("stallTimeoutSeconds", DEFAULT_STALL_TIMEOUT)
++            ),
++            api_key_env=runtime.get("apiKeyEnv", "FACTORY_API_KEY"),
++        )
++
++    def build_argv(self) -> list[str]:
++        """Compose the ``droid exec`` invocation as an argv list.
++
++        We always run with ``--input-format stream-jsonrpc
++        --output-format stream-jsonrpc`` so the harness can speak the
++        documented JSON-RPC protocol over stdin/stdout.
++        """
++        argv: list[str] = [
++            self.binary,
++            "exec",
++            "--input-format",
++            "stream-jsonrpc",
++            "--output-format",
++            "stream-jsonrpc",
++            "--auto",
++            self.auto_level,
++            "--cwd",
++            str(self.cwd),
++        ]
++        if self.model:
++            argv += ["-m", self.model]
++        if self.spec_model:
++            argv += ["--spec-model", self.spec_model]
++        if self.reasoning_effort:
++            argv += ["-r", self.reasoning_effort]
++        if self.spec_reasoning_effort:
++            argv += ["--spec-reasoning-effort", self.spec_reasoning_effort]
++        if self.use_spec:
++            argv += ["--use-spec"]
++        if self.mission:
++            argv += ["--mission"]
++            if self.worker_model:
++                argv += ["--worker-model", self.worker_model]
++            if self.worker_reasoning_effort:
++                argv += ["--worker-reasoning-effort", self.worker_reasoning_effort]
++            if self.validator_model:
++                argv += ["--validator-model", self.validator_model]
++            if self.validator_reasoning_effort:
++                argv += ["--validator-reasoning-effort", self.validator_reasoning_effort]
++        if self.append_system_prompt_file:
++            argv += [
++                "--append-system-prompt-file",
++                str(self.append_system_prompt_file),
++            ]
++        elif self.append_system_prompt:
++            argv += ["--append-system-prompt", self.append_system_prompt]
++        if self.enabled_tools:
++            argv += ["--enabled-tools", ",".join(self.enabled_tools)]
++        if self.disabled_tools:
++            argv += ["--disabled-tools", ",".join(self.disabled_tools)]
++        for tag in self.tags:
++            argv += ["--tag", tag]
++        if self.log_group_id:
++            argv += ["--log-group-id", self.log_group_id]
++        if self.skip_permissions_unsafe:
++            argv += ["--skip-permissions-unsafe"]
++        return argv
++
++
++@dataclass
++class RuntimeConfig:
++    """The complete runtime config for the Droid Manager."""
++
++    matrix: MatrixSettings
++    droid: DroidConfig
++    raw: dict[str, Any] = field(default_factory=dict)
++
++    @classmethod
++    def load(cls, openclaw_json: str | os.PathLike[str]) -> "RuntimeConfig":
++        """Load an ``openclaw.json`` file from disk."""
++        path = _expand(openclaw_json)
++        if not path.is_file():
++            raise FileNotFoundError(
++                f"openclaw.json not found at {path}; the manager runtime needs "
++                f"a populated config (see start-manager-agent.sh)"
++            )
++        raw = json.loads(path.read_text(encoding="utf-8"))
++        return cls(
++            matrix=MatrixSettings.from_openclaw(raw),
++            droid=DroidConfig.from_openclaw(raw),
++            raw=raw,
++        )
+diff --git a/droid-manager/src/droid_manager/harness.py b/droid-manager/src/droid_manager/harness.py
+new file mode 100644
+index 0000000..5507fab
+--- /dev/null
++++ b/droid-manager/src/droid_manager/harness.py
+@@ -0,0 +1,518 @@
++"""Subprocess + JSON-RPC stream wrapper around ``droid exec``.
++
++Speaks the protocol documented in
++https://docs.factory.ai/cli/droid-exec/overview:
++
++* Spawn ``droid exec --input-format stream-jsonrpc --output-format stream-jsonrpc``.
++* Each line written to stdin is one JSON-RPC request.
++* Each line read from stdout is one JSON-RPC response, server request, or
++  notification.
++* ``droid.session_notification`` notifications stream assistant text deltas,
++  tool events, token usage, errors, and ``turn_complete`` markers.
++* The droid process may issue server-to-client requests like
++  ``droid.request_permission`` and ``droid.ask_user`` that must be answered
++  so the agent keeps making progress.
++
++The harness exposes a clean async API:
++
++    async with DroidHarness(cfg) as harness:
++        session_id = await harness.initialize_session(name="matrix:!room")
++        async for event in harness.add_user_message_stream(text="hi"):
++            ...
++
++It also auto-restarts the subprocess on unclean exit and surfaces
++``HarnessEvent`` instances so the manager loop only has to care about
++"text delta", "tool call", "turn finished", and "permission requested".
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import os
++import shutil
++import signal
++import time
++import uuid
++from dataclasses import dataclass, field
++from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional
++
++from .config import DroidConfig
++
++logger = logging.getLogger("droid_manager.harness")
++
++# JSON-RPC method names defined by the droid exec stream protocol.
++METHOD_INITIALIZE = "droid.initialize_session"
++METHOD_LOAD = "droid.load_session"
++METHOD_FORK = "droid.fork_session"
++METHOD_ADD_MSG = "droid.add_user_message"
++METHOD_INTERRUPT = "droid.interrupt"
++METHOD_COMPACT = "droid.compact_history"
++METHOD_UPDATE_SETTINGS = "droid.update_settings"
++METHOD_LIST_TOOLS = "droid.list_tools"
++
++# Server -> client requests
++SRV_REQUEST_PERMISSION = "droid.request_permission"
++SRV_ASK_USER = "droid.ask_user"
++
++# Server -> client notifications
++NTF_SESSION = "droid.session_notification"
++
++
++@dataclass
++class HarnessRequest:
++    """A pending JSON-RPC request awaiting a response from ``droid exec``."""
++
++    id: str
++    method: str
++    params: dict[str, Any]
++    future: asyncio.Future = field(default_factory=asyncio.Future)
++
++
++@dataclass
++class HarnessEvent:
++    """Normalised event surfaced to the manager loop.
++
++    ``kind`` is one of:
++      * ``"text_delta"``         — partial assistant text (``content``)
++      * ``"text_complete"``      — full assistant message (``content``)
++      * ``"tool_use"``           — agent is calling a tool (``tool``, ``args``)
++      * ``"tool_result"``        — tool returned (``tool``, ``result``)
++      * ``"turn_complete"``      — turn ended; safe to reply to user
++      * ``"permission_request"`` — droid wants approval (``request_id``, ``request``)
++      * ``"ask_user"``           — droid wants out-of-band input (``request_id``, ``prompt``)
++      * ``"error"``              — error notification (``message``)
++      * ``"token_usage"``        — token usage update (``input``, ``output``)
++    """
++
++    kind: str
++    session_id: str
++    payload: dict[str, Any] = field(default_factory=dict)
++
++    @property
++    def content(self) -> str:
++        return str(self.payload.get("content") or "")
++
++
++PermissionResolver = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
++
++
++class DroidHarness:
++    """Async, line-delimited JSON-RPC client for ``droid exec``.
++
++    Lifecycle
++    ---------
++    1. ``await harness.start()`` — spawn the subprocess.
++    2. ``await harness.initialize_session(name=…)`` — create or attach.
++    3. ``async for ev in harness.add_user_message_stream(text=…)`` —
++       send a turn, stream events until ``turn_complete``.
++    4. ``await harness.stop()`` — terminate gracefully.
++    """
++
++    def __init__(
++        self,
++        config: DroidConfig,
++        *,
++        permission_resolver: PermissionResolver | None = None,
++        ask_user_resolver: PermissionResolver | None = None,
++    ) -> None:
++        self._cfg = config
++        self._proc: Optional[asyncio.subprocess.Process] = None
++        self._reader_task: Optional[asyncio.Task] = None
++        self._pending: Dict[str, HarnessRequest] = {}
++        self._event_queues: Dict[str, asyncio.Queue[HarnessEvent | None]] = {}
++        self._session_id: Optional[str] = None
++        self._lock = asyncio.Lock()
++        self._stopped = False
++        self._restart_attempts = 0
++        self._last_event_at = time.monotonic()
++        self._permission_resolver = permission_resolver or self._default_deny
++        self._ask_user_resolver = ask_user_resolver or self._default_unknown
++        self._on_exit: Optional[Callable[[int | None], None]] = None
++
++    # ------------------------------------------------------------------
++    # Lifecycle
++    # ------------------------------------------------------------------
++
++    async def __aenter__(self) -> "DroidHarness":
++        await self.start()
++        return self
++
++    async def __aexit__(self, *_exc: Any) -> None:
++        await self.stop()
++
++    async def start(self) -> None:
++        """Spawn the ``droid exec`` subprocess."""
++        if self._proc is not None:
++            return
++        if not shutil.which(self._cfg.binary):
++            raise FileNotFoundError(
++                f"droid binary '{self._cfg.binary}' not found on PATH. "
++                f"Install with: curl -fsSL https://app.factory.ai/cli | sh"
++            )
++        argv = self._cfg.build_argv()
++        env = os.environ.copy()
++        api_key = env.get(self._cfg.api_key_env)
++        if not api_key:
++            logger.warning(
++                "%s not set — droid exec may fail to authenticate. Generate "
++                "an API key at app.factory.ai/settings/api-keys.",
++                self._cfg.api_key_env,
++            )
++
++        # Ensure cwd exists. The Manager workspace is created earlier in
++        # start-manager-agent.sh, but be defensive when running standalone.
++        try:
++            self._cfg.cwd.mkdir(parents=True, exist_ok=True)
++        except Exception as exc:
++            logger.debug("cwd mkdir failed (%s); droid may still start", exc)
++
++        logger.info("Spawning droid harness: %s", " ".join(argv))
++        self._proc = await asyncio.create_subprocess_exec(
++            *argv,
++            stdin=asyncio.subprocess.PIPE,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.PIPE,
++            cwd=str(self._cfg.cwd),
++            env=env,
++        )
++        self._reader_task = asyncio.create_task(self._read_loop())
++        asyncio.create_task(self._stderr_loop())
++
++    async def stop(self) -> None:
++        """Terminate the subprocess and cancel readers."""
++        self._stopped = True
++        if self._reader_task and not self._reader_task.done():
++            self._reader_task.cancel()
++        proc = self._proc
++        self._proc = None
++        if proc and proc.returncode is None:
++            try:
++                proc.send_signal(signal.SIGTERM)
++                await asyncio.wait_for(proc.wait(), timeout=10)
++            except asyncio.TimeoutError:
++                logger.warning("droid harness did not exit; killing")
++                proc.kill()
++                await proc.wait()
++        # Drain pending futures with a CancelledError-like result
++        for req in self._pending.values():
++            if not req.future.done():
++                req.future.set_exception(RuntimeError("harness stopped"))
++        self._pending.clear()
++        for q in self._event_queues.values():
++            await q.put(None)
++        self._event_queues.clear()
++
++    # ------------------------------------------------------------------
++    # Public RPC API
++    # ------------------------------------------------------------------
++
++    async def initialize_session(
++        self,
++        *,
++        name: str | None = None,
++        resume_session_id: str | None = None,
++        metadata: dict[str, Any] | None = None,
++    ) -> str:
++        """Open a session and return its server-side id.
++
++        If ``resume_session_id`` is provided, use ``droid.load_session``; this
++        mirrors ``droid exec --session-id <id>`` and is how we reattach after
++        a Manager container restart.
++        """
++        params: dict[str, Any] = {}
++        if metadata:
++            params["metadata"] = metadata
++        if name:
++            params["name"] = name
++        if resume_session_id:
++            method = METHOD_LOAD
++            params["session_id"] = resume_session_id
++        else:
++            method = METHOD_INITIALIZE
++        result = await self.request(method, params)
++        session_id = result.get("session_id") or resume_session_id
++        if not session_id:
++            raise RuntimeError(f"{method} returned no session_id: {result!r}")
++        self._session_id = session_id
++        return session_id
++
++    async def fork_session(self, source_session_id: str) -> str:
++        """Fork an existing session and return the new session id."""
++        result = await self.request(METHOD_FORK, {"session_id": source_session_id})
++        new_id = result.get("session_id")
++        if not new_id:
++            raise RuntimeError(f"{METHOD_FORK} returned no session_id: {result!r}")
++        return new_id
++
++    async def interrupt(self, session_id: str | None = None) -> None:
++        await self.request(METHOD_INTERRUPT, {"session_id": session_id or self._session_id})
++
++    async def compact_history(self, prompt: str | None = None) -> dict[str, Any]:
++        params: dict[str, Any] = {"session_id": self._session_id}
++        if prompt:
++            params["prompt"] = prompt
++        return await self.request(METHOD_COMPACT, params)
++
++    async def list_tools(self) -> list[dict[str, Any]]:
++        result = await self.request(METHOD_LIST_TOOLS, {"session_id": self._session_id})
++        return result.get("tools") or []
++
++    async def add_user_message_stream(
++        self,
++        *,
++        text: str,
++        attachments: list[dict[str, Any]] | None = None,
++        session_id: str | None = None,
++    ) -> AsyncIterator[HarnessEvent]:
++        """Send a user message and stream events until the turn completes.
++
++        Yields ``HarnessEvent`` instances. The iterator terminates on
++        ``turn_complete`` or when the subprocess exits unexpectedly.
++        """
++        sid = session_id or self._session_id
++        if not sid:
++            raise RuntimeError(
++                "no session_id; call initialize_session() before add_user_message_stream()"
++            )
++        queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
++        self._event_queues[sid] = queue
++        params: dict[str, Any] = {"session_id": sid, "text": text}
++        if attachments:
++            params["attachments"] = attachments
++        # Fire-and-forget request: progress arrives via notifications, and the
++        # method itself returns a small ack we can ignore.
++        asyncio.create_task(self._fire_and_forget(METHOD_ADD_MSG, params))
++        while True:
++            event = await queue.get()
++            if event is None:
++                self._event_queues.pop(sid, None)
++                return
++            yield event
++            if event.kind == "turn_complete":
++                self._event_queues.pop(sid, None)
++                return
++
++    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
++        """Send a single JSON-RPC request and await its response."""
++        if not self._proc or not self._proc.stdin:
++            raise RuntimeError("harness not started")
++        rid = uuid.uuid4().hex
++        req = HarnessRequest(id=rid, method=method, params=params)
++        self._pending[rid] = req
++        payload = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
++        await self._write_line(payload)
++        try:
++            return await asyncio.wait_for(req.future, timeout=120)
++        except asyncio.TimeoutError as exc:
++            self._pending.pop(rid, None)
++            raise TimeoutError(f"droid harness timeout on {method}") from exc
++
++    async def respond(
++        self,
++        request_id: str,
++        *,
++        result: dict[str, Any] | None = None,
++        error: dict[str, Any] | None = None,
++    ) -> None:
++        """Reply to a server-to-client request (permission / ask_user)."""
++        payload: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
++        if error is not None:
++            payload["error"] = error
++        else:
++            payload["result"] = result or {}
++        await self._write_line(payload)
++
++    # ------------------------------------------------------------------
++    # Internal: read loop, write helper, notification routing
++    # ------------------------------------------------------------------
++
++    async def _fire_and_forget(self, method: str, params: dict[str, Any]) -> None:
++        try:
++            await self.request(method, params)
++        except Exception as exc:
++            logger.warning("droid harness %s failed: %s", method, exc)
++
++    async def _write_line(self, payload: dict[str, Any]) -> None:
++        if not self._proc or not self._proc.stdin:
++            raise RuntimeError("harness stdin is closed")
++        line = json.dumps(payload, ensure_ascii=False) + "\n"
++        self._proc.stdin.write(line.encode("utf-8"))
++        try:
++            await self._proc.stdin.drain()
++        except (BrokenPipeError, ConnectionResetError) as exc:
++            logger.error("droid harness stdin broken: %s", exc)
++            await self._handle_unclean_exit()
++
++    async def _read_loop(self) -> None:
++        assert self._proc and self._proc.stdout
++        try:
++            while True:
++                line = await self._proc.stdout.readline()
++                if not line:
++                    break
++                self._last_event_at = time.monotonic()
++                try:
++                    msg = json.loads(line.decode("utf-8", errors="replace").strip() or "{}")
++                except json.JSONDecodeError as exc:
++                    logger.debug("droid harness sent non-JSON line: %r (%s)", line, exc)
++                    continue
++                await self._handle_message(msg)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:  # pragma: no cover - defensive
++            logger.exception("droid harness read loop crashed: %s", exc)
++        finally:
++            await self._handle_unclean_exit()
++
++    async def _stderr_loop(self) -> None:
++        if not self._proc or not self._proc.stderr:
++            return
++        try:
++            while True:
++                line = await self._proc.stderr.readline()
++                if not line:
++                    return
++                logger.warning("droid stderr: %s", line.decode("utf-8", errors="replace").rstrip())
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            logger.debug("stderr loop ended: %s", exc)
++
++    async def _handle_message(self, msg: dict[str, Any]) -> None:
++        # 1. Response to one of our requests
++        if "id" in msg and ("result" in msg or "error" in msg):
++            rid = str(msg["id"])
++            req = self._pending.pop(rid, None)
++            if req and not req.future.done():
++                if "error" in msg:
++                    req.future.set_exception(
++                        RuntimeError(f"droid {req.method} error: {msg['error']}")
++                    )
++                else:
++                    req.future.set_result(msg.get("result") or {})
++            return
++
++        method = msg.get("method")
++        params = msg.get("params") or {}
++
++        # 2. Server-to-client request
++        if method in (SRV_REQUEST_PERMISSION, SRV_ASK_USER) and "id" in msg:
++            await self._handle_server_request(str(msg["id"]), method, params)
++            return
++
++        # 3. Notification
++        if method == NTF_SESSION:
++            self._dispatch_session_notification(params)
++            return
++
++        logger.debug("droid harness unhandled msg: %s", msg)
++
++    async def _handle_server_request(
++        self,
++        request_id: str,
++        method: str,
++        params: dict[str, Any],
++    ) -> None:
++        try:
++            if method == SRV_REQUEST_PERMISSION:
++                result = await self._permission_resolver(params)
++            else:  # SRV_ASK_USER
++                result = await self._ask_user_resolver(params)
++            await self.respond(request_id, result=result)
++        except Exception as exc:
++            logger.exception("server-request handler failed: %s", exc)
++            await self.respond(
++                request_id,
++                error={"code": -32000, "message": f"handler error: {exc}"},
++            )
++
++    def _dispatch_session_notification(self, params: dict[str, Any]) -> None:
++        """Translate a raw notification into a typed ``HarnessEvent``."""
++        sid = params.get("session_id") or self._session_id or ""
++        queue = self._event_queues.get(sid)
++        if queue is None:
++            return
++        kind = params.get("type") or params.get("event") or ""
++        event: HarnessEvent | None = None
++        if kind in ("text_delta", "assistant_text_delta"):
++            event = HarnessEvent("text_delta", sid, {"content": params.get("delta", "")})
++        elif kind in ("text_complete", "assistant_message", "message"):
++            event = HarnessEvent(
++                "text_complete", sid, {"content": params.get("text", "")}
++            )
++        elif kind in ("tool_use", "tool_call"):
++            event = HarnessEvent(
++                "tool_use",
++                sid,
++                {"tool": params.get("name", ""), "args": params.get("arguments", {})},
++            )
++        elif kind in ("tool_result", "tool_response"):
++            event = HarnessEvent(
++                "tool_result",
++                sid,
++                {"tool": params.get("name", ""), "result": params.get("result", "")},
++            )
++        elif kind in ("turn_complete", "turn_end", "done"):
++            event = HarnessEvent("turn_complete", sid, dict(params))
++        elif kind in ("error",):
++            event = HarnessEvent("error", sid, {"message": params.get("message", "")})
++        elif kind in ("token_usage", "usage"):
++            event = HarnessEvent(
++                "token_usage",
++                sid,
++                {
++                    "input": params.get("input_tokens", 0),
++                    "output": params.get("output_tokens", 0),
++                },
++            )
++        else:
++            event = HarnessEvent(kind or "unknown", sid, dict(params))
++        try:
++            queue.put_nowait(event)
++        except asyncio.QueueFull:  # pragma: no cover
++            logger.warning("event queue full for session %s", sid)
++
++    async def _handle_unclean_exit(self) -> None:
++        if self._stopped:
++            return
++        proc = self._proc
++        if proc is None:
++            return
++        code = proc.returncode
++        logger.warning("droid harness exited (code=%s); attempting restart", code)
++        # Flush pending futures
++        for req in list(self._pending.values()):
++            if not req.future.done():
++                req.future.set_exception(RuntimeError(f"droid harness exited (code={code})"))
++        self._pending.clear()
++        for sid, q in list(self._event_queues.items()):
++            await q.put(HarnessEvent("error", sid, {"message": f"harness exited code={code}"}))
++            await q.put(None)
++        self._event_queues.clear()
++        self._proc = None
++        if self._on_exit:
++            try:
++                self._on_exit(code)
++            except Exception:
++                logger.exception("on_exit callback raised")
++
++    # ------------------------------------------------------------------
++    # Default resolvers — overridable from DroidManager
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    async def _default_deny(params: dict[str, Any]) -> dict[str, Any]:
++        """Deny permission by default for safety; manager.py overrides this."""
++        logger.warning(
++            "droid requested permission but no resolver is wired; denying: %s",
++            params.get("description") or params,
++        )
++        return {"granted": False, "reason": "no resolver configured"}
++
++    @staticmethod
++    async def _default_unknown(params: dict[str, Any]) -> dict[str, Any]:
++        """Default ``ask_user`` resolver — return an empty answer."""
++        logger.info("droid ask_user (no resolver): %s", params.get("prompt"))
++        return {"answer": ""}
+diff --git a/droid-manager/src/droid_manager/manager.py b/droid-manager/src/droid_manager/manager.py
+new file mode 100644
+index 0000000..ff2dc63
+--- /dev/null
++++ b/droid-manager/src/droid_manager/manager.py
+@@ -0,0 +1,308 @@
++"""Main Droid Manager loop.
++
++Owns one :class:`MatrixChannel` and one :class:`DroidHarness`, and routes
++events between them:
++
++    Matrix message  ──►  DroidHarness.add_user_message_stream(text=…)
++    text_delta / text_complete events  ──►  Matrix room_send
++    permission_request                 ──►  Matrix DM to admin (optional approval)
++    turn_complete                      ──►  flush typing + read receipt
++
++The manager maintains one droid session per Matrix room (DM or group),
++persisted via :class:`SessionStore` so it survives container restarts.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++import signal
++from pathlib import Path
++from typing import Any, Optional
++
++from .config import RuntimeConfig
++from .harness import DroidHarness, HarnessEvent
++from .matrix_channel import MatrixChannel, MatrixInbound
++from .session_store import SessionRecord, SessionStore
++
++logger = logging.getLogger("droid_manager.manager")
++
++DEFAULT_OPENCLAW_JSON = "~/manager-workspace/openclaw.json"
++
++# How often to send a typing indicator while a turn is streaming.
++TYPING_REFRESH_S = 25
++# Max characters per Matrix message — Matrix supports much more but Element
++# truncates long messages. We chunk above this threshold.
++MAX_REPLY_CHARS = 16_000
++
++
++def _expand(path: str | os.PathLike[str]) -> Path:
++    return Path(os.path.expandvars(os.path.expanduser(str(path))))
++
++
++class DroidManager:
++    """Top-level orchestrator: Matrix ⇄ Droid harness."""
++
++    def __init__(
++        self,
++        config: RuntimeConfig,
++        *,
++        openclaw_workspace: Optional[Path] = None,
++    ) -> None:
++        self._cfg = config
++        self._workspace = openclaw_workspace or _expand("~/manager-workspace")
++        sync_token = self._workspace / ".matrix_sync_token"
++        e2ee_store = self._workspace / ".matrix_crypto_store"
++        self._matrix = MatrixChannel(
++            config.matrix,
++            sync_token_path=sync_token,
++            e2ee_store_path=e2ee_store,
++        )
++        self._harness = DroidHarness(
++            config.droid,
++            permission_resolver=self._resolve_permission,
++            ask_user_resolver=self._resolve_ask_user,
++        )
++        self._sessions = SessionStore(config.droid.session_dir)
++        # room_id -> task currently driving a turn for that room
++        self._inflight: dict[str, asyncio.Task] = {}
++        # room_id -> pending text buffer (for chunked streaming sends)
++        self._buffers: dict[str, list[str]] = {}
++        self._shutdown = asyncio.Event()
++
++    # ------------------------------------------------------------------
++    # Lifecycle
++    # ------------------------------------------------------------------
++
++    async def run(self) -> None:
++        """Run until SIGTERM / SIGINT."""
++        loop = asyncio.get_running_loop()
++        for sig in (signal.SIGTERM, signal.SIGINT):
++            try:
++                loop.add_signal_handler(sig, self._shutdown.set)
++            except NotImplementedError:  # pragma: no cover - Windows
++                pass
++
++        await self._harness.start()
++        await self._matrix.start()
++        logger.info(
++            "DroidManager up — matrix user=%s cwd=%s model=%s auto=%s",
++            self._matrix.user_id,
++            self._cfg.droid.cwd,
++            self._cfg.droid.model or "<default>",
++            self._cfg.droid.auto_level,
++        )
++
++        try:
++            await asyncio.gather(self._dispatch_loop(), self._shutdown.wait())
++        finally:
++            await self.shutdown()
++
++    async def shutdown(self) -> None:
++        for task in list(self._inflight.values()):
++            if not task.done():
++                task.cancel()
++        await self._matrix.stop()
++        await self._harness.stop()
++
++    # ------------------------------------------------------------------
++    # Dispatch
++    # ------------------------------------------------------------------
++
++    async def _dispatch_loop(self) -> None:
++        """Pull inbound Matrix events and assign them to per-room workers."""
++        while not self._shutdown.is_set():
++            inbound = await self._matrix.inbound.get()
++            existing = self._inflight.get(inbound.room_id)
++            if existing and not existing.done():
++                # Serialize turns per room: wait for current turn to finish
++                # before starting the next one, so the droid session sees
++                # messages in order.
++                logger.debug(
++                    "queuing inbound for %s (current turn in flight)",
++                    inbound.room_id,
++                )
++                self._inflight[inbound.room_id] = asyncio.create_task(
++                    self._after(existing, inbound)
++                )
++            else:
++                self._inflight[inbound.room_id] = asyncio.create_task(
++                    self._handle_inbound(inbound)
++                )
++
++    async def _after(self, prior: asyncio.Task, inbound: MatrixInbound) -> None:
++        try:
++            await prior
++        except Exception:
++            pass
++        await self._handle_inbound(inbound)
++
++    async def _handle_inbound(self, inbound: MatrixInbound) -> None:
++        room_id = inbound.room_id
++        try:
++            await self._matrix.mark_read(room_id, inbound.event_id)
++            await self._matrix.set_typing(room_id, True)
++            session_id = await self._ensure_session(room_id, kind="dm" if inbound.is_dm else "room")
++            await self._stream_turn(session_id, inbound)
++        except Exception as exc:
++            logger.exception("turn failed for %s: %s", room_id, exc)
++            await self._matrix.send_reply(
++                room_id, f"⚠️ droid harness error: {exc}"
++            )
++        finally:
++            await self._matrix.set_typing(room_id, False)
++            self._inflight.pop(room_id, None)
++
++    async def _ensure_session(self, room_id: str, *, kind: str) -> str:
++        existing = self._sessions.get(room_id)
++        if existing and existing.session_id:
++            try:
++                sid = await self._harness.initialize_session(
++                    resume_session_id=existing.session_id,
++                    name=f"matrix:{room_id}",
++                    metadata={"room_id": room_id, "kind": kind},
++                )
++                self._sessions.touch(room_id)
++                return sid
++            except Exception as exc:
++                logger.warning(
++                    "could not resume droid session %s for %s (%s); starting fresh",
++                    existing.session_id,
++                    room_id,
++                    exc,
++                )
++        sid = await self._harness.initialize_session(
++            name=f"matrix:{room_id}",
++            metadata={"room_id": room_id, "kind": kind},
++        )
++        self._sessions.put(SessionRecord(room_id=room_id, session_id=sid, kind=kind))
++        return sid
++
++    async def _stream_turn(self, session_id: str, inbound: MatrixInbound) -> None:
++        """Pump a single turn end-to-end."""
++        text_buffer: list[str] = []
++        sent_any = False
++        typing_refresher = asyncio.create_task(self._typing_refresh(inbound.room_id))
++        try:
++            async for event in self._harness.add_user_message_stream(
++                text=inbound.body, session_id=session_id
++            ):
++                await self._handle_event(inbound, event, text_buffer)
++                if event.kind == "text_complete":
++                    sent_any = True
++                if event.kind == "turn_complete":
++                    break
++        finally:
++            typing_refresher.cancel()
++            try:
++                await typing_refresher
++            except (asyncio.CancelledError, Exception):
++                pass
++
++        # Flush any leftover streamed text that never got terminated by a
++        # text_complete event (rare; some models only emit deltas).
++        leftover = "".join(text_buffer).strip()
++        if leftover and not sent_any:
++            await self._send_chunked(inbound.room_id, leftover)
++
++    async def _handle_event(
++        self,
++        inbound: MatrixInbound,
++        event: HarnessEvent,
++        text_buffer: list[str],
++    ) -> None:
++        room_id = inbound.room_id
++        if event.kind == "text_delta":
++            text_buffer.append(event.content)
++        elif event.kind == "text_complete":
++            content = event.content or "".join(text_buffer)
++            text_buffer.clear()
++            if content.strip():
++                await self._send_chunked(room_id, content)
++        elif event.kind == "tool_use":
++            tool = event.payload.get("tool", "?")
++            logger.info("droid tool_use room=%s tool=%s", room_id, tool)
++        elif event.kind == "tool_result":
++            logger.debug("droid tool_result room=%s", room_id)
++        elif event.kind == "error":
++            msg = event.payload.get("message") or "(unspecified error)"
++            await self._matrix.send_reply(room_id, f"⚠️ droid error: {msg}")
++        elif event.kind == "token_usage":
++            logger.debug(
++                "tokens room=%s in=%s out=%s",
++                room_id,
++                event.payload.get("input"),
++                event.payload.get("output"),
++            )
++
++    async def _send_chunked(self, room_id: str, text: str) -> None:
++        if len(text) <= MAX_REPLY_CHARS:
++            await self._matrix.send_reply(room_id, text)
++            return
++        # Try to split on paragraph boundaries to keep messages readable.
++        chunks: list[str] = []
++        buf: list[str] = []
++        size = 0
++        for para in text.split("\n\n"):
++            if size + len(para) + 2 > MAX_REPLY_CHARS and buf:
++                chunks.append("\n\n".join(buf))
++                buf = [para]
++                size = len(para)
++            else:
++                buf.append(para)
++                size += len(para) + 2
++        if buf:
++            chunks.append("\n\n".join(buf))
++        for i, chunk in enumerate(chunks, 1):
++            tail = f"\n\n_(part {i}/{len(chunks)})_" if len(chunks) > 1 else ""
++            await self._matrix.send_reply(room_id, chunk + tail)
++
++    async def _typing_refresh(self, room_id: str) -> None:
++        try:
++            while True:
++                await asyncio.sleep(TYPING_REFRESH_S)
++                await self._matrix.set_typing(room_id, True)
++        except asyncio.CancelledError:
++            return
++
++    # ------------------------------------------------------------------
++    # Server -> client resolvers
++    # ------------------------------------------------------------------
++
++    async def _resolve_permission(self, params: dict[str, Any]) -> dict[str, Any]:
++        """Default policy: auto-grant when ``--auto`` already authorizes the tier.
++
++        ``droid exec --auto medium`` already gates most prompts internally, so
++        if we still get a ``request_permission`` callback it's for a tier above
++        the configured autonomy level. We deny by default; operators can plug
++        in a real approval flow (Matrix DM, Slack, web UI, etc.) by subclassing
++        :class:`DroidManager` and overriding this method.
++        """
++        desc = params.get("description") or params.get("tool") or "?"
++        # In skip_permissions_unsafe mode, grant everything.
++        if self._cfg.droid.skip_permissions_unsafe:
++            logger.warning("auto-granting permission (unsafe mode): %s", desc)
++            return {"granted": True}
++        logger.warning(
++            "denying permission for %s — implement DroidManager._resolve_permission "
++            "to wire approvals.",
++            desc,
++        )
++        return {"granted": False, "reason": "no approval flow configured"}
++
++    async def _resolve_ask_user(self, params: dict[str, Any]) -> dict[str, Any]:
++        prompt = params.get("prompt") or ""
++        logger.info("droid ask_user (no responder): %s", prompt)
++        return {"answer": ""}
++
++
++async def main_async(openclaw_json: str | os.PathLike[str] | None = None) -> None:
++    path = openclaw_json or os.environ.get("OPENCLAW_CONFIG_PATH") or DEFAULT_OPENCLAW_JSON
++    config = RuntimeConfig.load(path)
++    manager = DroidManager(config)
++    await manager.run()
++
++
++def run(openclaw_json: str | os.PathLike[str] | None = None) -> None:
++    asyncio.run(main_async(openclaw_json))
+diff --git a/droid-manager/src/droid_manager/matrix_channel.py b/droid-manager/src/droid_manager/matrix_channel.py
+new file mode 100644
+index 0000000..337c637
+--- /dev/null
++++ b/droid-manager/src/droid_manager/matrix_channel.py
+@@ -0,0 +1,474 @@
++"""matrix-nio Matrix transport for the Droid Manager.
++
++A focused subset of HiClaw's CoPaw ``MatrixChannel`` — extracted so the
++Droid Manager runs without a hard dependency on ``copaw`` or ``qwenpaw``.
++It covers what the Manager actually needs:
++
++* Login via ``access_token`` (whoami → user_id, device_id, optional crypto store).
++* Auto-join invited rooms.
++* Allowlist enforcement for DMs and group rooms.
++* Per-room ``requireMention`` policy.
++* Long-poll ``sync_forever`` loop with persisted ``next_batch`` token.
++* Markdown → HTML formatting for replies (matches OpenClaw / CoPaw).
++* Simple read receipt + typing indicator UX.
++
++Inbound messages are pushed to an ``asyncio.Queue`` that the manager loop
++consumes. Outbound replies are sent via :meth:`send_reply`.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import html
++import logging
++import os
++import re
++import time
++import urllib.parse
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Optional
++
++from nio import (  # type: ignore[import-not-found]
++    AsyncClient,
++    AsyncClientConfig,
++    MatrixRoom,
++    RoomMessageText,
++    SyncResponse,
++    WhoamiResponse,
++)
++from nio.responses import JoinedMembersResponse  # type: ignore[import-not-found]
++
++from .config import MatrixSettings
++
++logger = logging.getLogger("droid_manager.matrix")
++
++DM_CACHE_TTL_MS = 30_000
++
++
++def _normalize_user_id(uid: str) -> str:
++    uid = uid.strip().lower()
++    if uid and not uid.startswith("@"):
++        uid = "@" + uid
++    return uid
++
++
++def _md_to_html(text: str) -> str:
++    """Render markdown → HTML for the Matrix ``formatted_body`` field."""
++    try:
++        from markdown_it import MarkdownIt
++
++        md = MarkdownIt(
++            "commonmark",
++            {"html": False, "linkify": True, "breaks": True, "typographer": False},
++        )
++        md.enable("strikethrough")
++        md.enable("table")
++        try:
++            from linkify_it import LinkifyIt
++
++            md.linkify = LinkifyIt()
++        except ImportError:
++            pass
++        return md.render(text).rstrip("\n")
++    except ImportError:
++        return html.escape(text).replace("\n", "<br>\n")
++
++
++@dataclass
++class MatrixInbound:
++    """Inbound user-visible message — what we feed to the harness."""
++
++    room_id: str
++    sender_id: str
++    body: str
++    is_dm: bool
++    event_id: str
++    timestamp: Optional[int] = None
++    formatted_body: Optional[str] = None
++
++
++class MatrixChannel:
++    """Lightweight matrix-nio runtime for the Droid Manager."""
++
++    def __init__(
++        self,
++        settings: MatrixSettings,
++        *,
++        sync_token_path: Optional[Path] = None,
++        e2ee_store_path: Optional[Path] = None,
++    ) -> None:
++        self._cfg = settings
++        self._client: Optional[AsyncClient] = None
++        self._user_id: Optional[str] = None
++        self._sync_task: Optional[asyncio.Task] = None
++        self._sync_token_path = sync_token_path
++        self._e2ee_store_path = e2ee_store_path
++        self._dm_cache: dict[str, dict[str, Any]] = {}
++        self._inbound_queue: asyncio.Queue[MatrixInbound] = asyncio.Queue()
++        self._allow_set = frozenset(
++            _normalize_user_id(u) for u in (settings.allow_from or [])
++        ) | frozenset(
++            _normalize_user_id(u) for u in (settings.group_allow_from or [])
++        )
++
++    @property
++    def user_id(self) -> str | None:
++        return self._user_id
++
++    @property
++    def inbound(self) -> "asyncio.Queue[MatrixInbound]":
++        return self._inbound_queue
++
++    # ------------------------------------------------------------------
++    # Lifecycle
++    # ------------------------------------------------------------------
++
++    async def start(self) -> None:
++        if not self._cfg.homeserver:
++            raise RuntimeError(
++                "Matrix homeserver not configured — check channels.matrix in openclaw.json"
++            )
++        if not self._cfg.access_token:
++            raise RuntimeError(
++                "Matrix access_token not configured — Manager cannot connect"
++            )
++
++        store_path = None
++        if self._cfg.encryption and self._e2ee_store_path:
++            self._e2ee_store_path.mkdir(parents=True, exist_ok=True)
++            store_path = str(self._e2ee_store_path)
++
++        sync_s = self._cfg.sync_timeout_ms / 1000
++        request_timeout = max(sync_s + 30, 60)
++        client_config = AsyncClientConfig(
++            store_sync_tokens=False,
++            encryption_enabled=self._cfg.encryption,
++            request_timeout=request_timeout,
++        )
++        self._client = AsyncClient(
++            self._cfg.homeserver,
++            user="",
++            store_path=store_path or "",
++            config=client_config,
++        )
++        self._client.access_token = self._cfg.access_token
++        whoami = await self._client.whoami()
++        if not isinstance(whoami, WhoamiResponse):
++            raise RuntimeError(f"Matrix whoami failed: {whoami}")
++        self._user_id = whoami.user_id
++        self._client.user_id = whoami.user_id
++        self._client.user = whoami.user_id
++        if whoami.device_id:
++            self._client.device_id = whoami.device_id
++        logger.info(
++            "matrix logged in as %s (device=%s, e2ee=%s)",
++            self._user_id,
++            whoami.device_id,
++            self._cfg.encryption,
++        )
++        if self._cfg.encryption and self._client.store_path and self._client.device_id:
++            self._client.load_store()
++            if self._client.should_upload_keys:
++                await self._client.keys_upload()
++
++        self._client.add_event_callback(self._on_text, (RoomMessageText,))
++        self._sync_task = asyncio.create_task(self._sync_loop())
++
++    async def stop(self) -> None:
++        if self._sync_task and not self._sync_task.done():
++            self._sync_task.cancel()
++            try:
++                await self._sync_task
++            except asyncio.CancelledError:
++                pass
++        if self._client:
++            await self._client.close()
++
++    # ------------------------------------------------------------------
++    # Outbound
++    # ------------------------------------------------------------------
++
++    async def send_reply(self, room_id: str, text: str, *, html_body: str | None = None) -> None:
++        """Send a markdown-formatted message into a room."""
++        if not self._client:
++            return
++        formatted = html_body if html_body is not None else _md_to_html(text)
++        content: dict[str, Any] = {
++            "msgtype": "m.text",
++            "body": text,
++            "format": "org.matrix.custom.html",
++            "formatted_body": formatted,
++        }
++        try:
++            await self._client.room_send(
++                room_id=room_id,
++                message_type="m.room.message",
++                content=content,
++                ignore_unverified_devices=True,
++            )
++        except Exception as exc:
++            logger.warning("matrix send_reply failed in %s: %s", room_id, exc)
++
++    async def set_typing(self, room_id: str, typing: bool, timeout_ms: int = 30_000) -> None:
++        if not self._client:
++            return
++        try:
++            await self._client.room_typing(
++                room_id, typing_state=typing, timeout=timeout_ms
++            )
++        except Exception as exc:
++            logger.debug("typing %s failed: %s", room_id, exc)
++
++    async def mark_read(self, room_id: str, event_id: str) -> None:
++        if not self._client or not event_id:
++            return
++        try:
++            await self._client.room_read_markers(
++                room_id, fully_read_event=event_id, read_event=event_id
++            )
++        except Exception as exc:
++            logger.debug("read_markers %s failed: %s", room_id, exc)
++
++    # ------------------------------------------------------------------
++    # Inbound dispatch
++    # ------------------------------------------------------------------
++
++    async def _on_text(self, room: MatrixRoom, event: RoomMessageText) -> None:
++        if not self._user_id or event.sender == self._user_id:
++            return
++        room_id = room.room_id
++        sender_id = event.sender
++        text = event.body or ""
++
++        is_dm = await self._is_dm_room(room_id, sender_id)
++
++        if not self._check_allowed(sender_id, is_dm):
++            return
++
++        # Group rooms with requireMention need an @mention to wake the bot.
++        if not is_dm and self._require_mention(room_id):
++            if not self._was_mentioned(event, text):
++                return
++
++        # Strip leading @mention so slash commands parse cleanly downstream.
++        stripped = self._strip_mention_prefix(text, room)
++        if stripped.strip() == "NO_REPLY":
++            return
++
++        formatted = event.source.get("content", {}).get("formatted_body")
++
++        await self._inbound_queue.put(
++            MatrixInbound(
++                room_id=room_id,
++                sender_id=sender_id,
++                body=stripped or text,
++                is_dm=is_dm,
++                event_id=event.event_id,
++                timestamp=getattr(event, "server_timestamp", None),
++                formatted_body=formatted,
++            )
++        )
++
++    def _check_allowed(self, sender_id: str, is_dm: bool) -> bool:
++        normalized = _normalize_user_id(sender_id)
++        if is_dm:
++            if self._cfg.dm_policy == "disabled":
++                return False
++            if self._cfg.dm_policy == "allowlist" and normalized not in self._allow_set:
++                logger.debug("DM blocked from %s", sender_id)
++                return False
++        else:
++            if self._cfg.group_policy == "disabled":
++                return False
++            if (
++                self._cfg.group_policy == "allowlist"
++                and normalized not in self._allow_set
++            ):
++                logger.debug("group msg blocked from %s", sender_id)
++                return False
++        return True
++
++    def _require_mention(self, room_id: str) -> bool:
++        room_cfg = self._cfg.groups.get(room_id) or self._cfg.groups.get("*")
++        if room_cfg:
++            if room_cfg.get("autoReply") is True:
++                return False
++            if "requireMention" in room_cfg:
++                return bool(room_cfg["requireMention"])
++        return True
++
++    def _was_mentioned(self, event: RoomMessageText, text: str) -> bool:
++        if not self._user_id:
++            return False
++        content = event.source.get("content", {})
++        mentions = content.get("m.mentions", {})
++        if self._user_id in mentions.get("user_ids", []):
++            return True
++        if mentions.get("room"):
++            return True
++        formatted_body = content.get("formatted_body", "") or ""
++        if self._user_id:
++            escaped = re.escape(self._user_id)
++            if re.search(
++                rf'href=["\']https://matrix\.to/#/{escaped}["\']',
++                formatted_body,
++                re.IGNORECASE,
++            ):
++                return True
++            encoded = re.escape(urllib.parse.quote(self._user_id))
++            if re.search(
++                rf'href=["\']https://matrix\.to/#/{encoded}["\']',
++                formatted_body,
++                re.IGNORECASE,
++            ):
++                return True
++            if re.search(re.escape(self._user_id), text, re.IGNORECASE):
++                return True
++        return False
++
++    def _strip_mention_prefix(self, text: str, room: MatrixRoom) -> str:
++        if not self._user_id:
++            return text
++        escaped = re.escape(self._user_id)
++        result = re.sub(rf"^{escaped}\s*:?\s*", "", text, flags=re.IGNORECASE)
++        if result != text:
++            return result.strip()
++        try:
++            display = room.user_name(self._user_id) or ""
++        except Exception:
++            display = ""
++        if display and display != self._user_id:
++            result = re.sub(
++                rf"^{re.escape(display)}\s*:?\s*", "", text, flags=re.IGNORECASE
++            )
++            if result != text:
++                result = re.sub(r"^[^\w/]+", "", result)
++                return result.strip()
++        localpart = self._user_id.split(":")[0].lstrip("@")
++        if localpart:
++            result = re.sub(
++                rf"^{re.escape(localpart)}\s*:?\s*",
++                "",
++                text,
++                flags=re.IGNORECASE,
++            )
++            if result != text:
++                result = re.sub(r"^[^\w/]+", "", result)
++                return result.strip()
++        return text
++
++    # ------------------------------------------------------------------
++    # DM detection (Matrix API)
++    # ------------------------------------------------------------------
++
++    async def _is_dm_room(self, room_id: str, sender_id: str) -> bool:
++        if not self._client or not self._user_id:
++            return False
++        now = int(time.time() * 1000)
++        cached = self._dm_cache.get(room_id)
++        if cached and (now - cached["ts"]) < DM_CACHE_TTL_MS:
++            members = cached["members"]
++            return (
++                len(members) == 2
++                and self._user_id in members
++                and sender_id in members
++            )
++        try:
++            resp = await self._client.joined_members(room_id)
++            if isinstance(resp, JoinedMembersResponse):
++                members = [m.user_id for m in resp.members]
++                self._dm_cache[room_id] = {"members": members, "ts": now}
++                return (
++                    len(members) == 2
++                    and self._user_id in members
++                    and sender_id in members
++                )
++        except Exception as exc:
++            logger.debug("joined_members %s failed: %s", room_id, exc)
++        return False
++
++    # ------------------------------------------------------------------
++    # Sync loop with persisted next_batch token
++    # ------------------------------------------------------------------
++
++    def _load_token(self) -> Optional[str]:
++        if not self._sync_token_path or not self._sync_token_path.is_file():
++            return None
++        try:
++            return self._sync_token_path.read_text(encoding="utf-8").strip() or None
++        except OSError:
++            return None
++
++    def _save_token(self, token: str) -> None:
++        if not self._sync_token_path:
++            return
++        try:
++            self._sync_token_path.parent.mkdir(parents=True, exist_ok=True)
++            self._sync_token_path.write_text(token, encoding="utf-8")
++        except OSError as exc:
++            logger.debug("sync token write failed: %s", exc)
++
++    async def _e2ee_maintenance(self) -> None:
++        if not self._cfg.encryption or not self._client or not self._client.olm:
++            return
++        try:
++            if self._client.should_upload_keys:
++                await self._client.keys_upload()
++            if self._client.should_query_keys:
++                await self._client.keys_query()
++            if self._client.should_claim_keys:
++                await self._client.keys_claim(
++                    self._client.get_users_for_key_claiming()
++                )
++            await self._client.send_to_device_messages()
++        except Exception as exc:
++            logger.debug("e2ee maintenance error: %s", exc)
++
++    async def _sync_loop(self) -> None:
++        assert self._client is not None
++        next_batch = self._load_token()
++        if next_batch is None:
++            # First-boot catch-up: suppress callbacks so we don't replay history.
++            saved_cbs = self._client.event_callbacks[:]
++            self._client.event_callbacks.clear()
++            try:
++                resp = await self._client.sync(
++                    timeout=self._cfg.sync_timeout_ms, full_state=True
++                )
++            finally:
++                self._client.event_callbacks.extend(saved_cbs)
++            if isinstance(resp, SyncResponse):
++                next_batch = resp.next_batch
++                if next_batch:
++                    self._save_token(next_batch)
++                if self._cfg.auto_join == "always":
++                    for invited in resp.rooms.invite:
++                        logger.info("auto-joining %s", invited)
++                        await self._client.join(invited)
++                await self._e2ee_maintenance()
++
++        while True:
++            try:
++                resp = await self._client.sync(
++                    timeout=self._cfg.sync_timeout_ms,
++                    since=next_batch,
++                    full_state=False,
++                )
++                if isinstance(resp, SyncResponse):
++                    next_batch = resp.next_batch
++                    if next_batch:
++                        self._save_token(next_batch)
++                    if self._cfg.auto_join == "always":
++                        for invited in resp.rooms.invite:
++                            logger.info("auto-joining %s", invited)
++                            await self._client.join(invited)
++                    await self._e2ee_maintenance()
++                else:
++                    logger.warning("sync error: %s", resp)
++                    await asyncio.sleep(5)
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                logger.exception("sync loop exception: %s", exc)
++                await asyncio.sleep(5)
+diff --git a/droid-manager/src/droid_manager/session_store.py b/droid-manager/src/droid_manager/session_store.py
+new file mode 100644
+index 0000000..99c8b12
+--- /dev/null
++++ b/droid-manager/src/droid_manager/session_store.py
+@@ -0,0 +1,109 @@
++"""Persistent map from Matrix room/DM identity to a droid session id.
++
++Each session id is written to ``${session_dir}/<safe_name>.json`` so we can
++re-attach to the same droid context after a Manager container restart.
++
++File layout (one JSON file per room/DM)::
++
++    {
++        "room_id": "!abc123:hiclaw.example",
++        "session_id": "8af22e0a-d222-42c6-8c7e-7a059e391b0b",
++        "created_at": 1716350123,
++        "last_used_at": 1716350987,
++        "kind": "dm"
++    }
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import time
++from dataclasses import dataclass, asdict, field
++from pathlib import Path
++from typing import Optional
++
++logger = logging.getLogger("droid_manager.sessions")
++
++
++def _safe_filename(name: str) -> str:
++    """Map an arbitrary string to a filesystem-safe file name."""
++    safe = []
++    for ch in name:
++        if ch.isalnum() or ch in ("-", "_", "."):
++            safe.append(ch)
++        else:
++            safe.append("_")
++    out = "".join(safe).strip("_") or "default"
++    return out[:200]  # keep well under typical 255-byte limit
++
++
++@dataclass
++class SessionRecord:
++    room_id: str
++    session_id: str
++    created_at: int = field(default_factory=lambda: int(time.time()))
++    last_used_at: int = field(default_factory=lambda: int(time.time()))
++    kind: str = "room"  # "dm" or "room"
++    extra: dict = field(default_factory=dict)
++
++
++class SessionStore:
++    """File-backed session map. Thread-unsafe; called from the async loop."""
++
++    def __init__(self, directory: str | os.PathLike[str]) -> None:
++        self._dir = Path(os.path.expandvars(os.path.expanduser(str(directory))))
++        self._dir.mkdir(parents=True, exist_ok=True)
++
++    def _path_for(self, room_id: str) -> Path:
++        return self._dir / f"{_safe_filename(room_id)}.json"
++
++    def get(self, room_id: str) -> Optional[SessionRecord]:
++        path = self._path_for(room_id)
++        if not path.is_file():
++            return None
++        try:
++            data = json.loads(path.read_text(encoding="utf-8"))
++        except (OSError, json.JSONDecodeError) as exc:
++            logger.warning("session_store: read %s failed: %s", path, exc)
++            return None
++        return SessionRecord(
++            room_id=data.get("room_id", room_id),
++            session_id=data.get("session_id", ""),
++            created_at=int(data.get("created_at", time.time())),
++            last_used_at=int(data.get("last_used_at", time.time())),
++            kind=data.get("kind", "room"),
++            extra=data.get("extra") or {},
++        )
++
++    def put(self, record: SessionRecord) -> None:
++        path = self._path_for(record.room_id)
++        try:
++            path.write_text(json.dumps(asdict(record), indent=2), encoding="utf-8")
++        except OSError as exc:
++            logger.warning("session_store: write %s failed: %s", path, exc)
++
++    def touch(self, room_id: str) -> None:
++        existing = self.get(room_id)
++        if existing is None:
++            return
++        existing.last_used_at = int(time.time())
++        self.put(existing)
++
++    def delete(self, room_id: str) -> None:
++        path = self._path_for(room_id)
++        try:
++            path.unlink(missing_ok=True)
++        except OSError as exc:
++            logger.debug("session_store: delete %s failed: %s", path, exc)
++
++    def all(self) -> list[SessionRecord]:
++        out: list[SessionRecord] = []
++        for path in self._dir.glob("*.json"):
++            try:
++                data = json.loads(path.read_text(encoding="utf-8"))
++                out.append(SessionRecord(**{k: v for k, v in data.items() if k in SessionRecord.__annotations__}))
++            except Exception:
++                continue
++        return out
+diff --git a/droid-manager/src/droid_manager/templates/runtime.droid.json b/droid-manager/src/droid_manager/templates/runtime.droid.json
+new file mode 100644
+index 0000000..29352e8
+--- /dev/null
++++ b/droid-manager/src/droid_manager/templates/runtime.droid.json
+@@ -0,0 +1,29 @@
++{
++  "runtime": {
++    "droid": {
++      "binary": "droid",
++      "model": "${HICLAW_DROID_MODEL}",
++      "specModel": null,
++      "reasoningEffort": "medium",
++      "specReasoningEffort": null,
++      "autoLevel": "${HICLAW_DROID_AUTO}",
++      "useSpec": false,
++      "mission": false,
++      "workerModel": null,
++      "workerReasoningEffort": null,
++      "validatorModel": null,
++      "validatorReasoningEffort": null,
++      "cwd": "/root/manager-workspace",
++      "appendSystemPromptFile": "/root/manager-workspace/SOUL.md",
++      "appendSystemPrompt": null,
++      "enabledTools": [],
++      "disabledTools": [],
++      "tags": ["hiclaw", "manager"],
++      "logGroupId": "hiclaw-manager",
++      "skipPermissionsUnsafe": false,
++      "sessionDir": "/root/.droid-manager/sessions",
++      "stallTimeoutSeconds": 1800,
++      "apiKeyEnv": "FACTORY_API_KEY"
++    }
++  }
++}
+diff --git a/droid-manager/tests/test_config.py b/droid-manager/tests/test_config.py
+new file mode 100644
+index 0000000..924324e
+--- /dev/null
++++ b/droid-manager/tests/test_config.py
+@@ -0,0 +1,136 @@
++"""Unit tests for :mod:`droid_manager.config`."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from droid_manager.config import DroidConfig, MatrixSettings, RuntimeConfig
++
++
++SAMPLE = {
++    "channels": {
++        "matrix": {
++            "enabled": True,
++            "homeserver": "https://matrix.example.com",
++            "accessToken": "syt_token_xxx",
++            "userId": "@manager:matrix.example.com",
++            "encryption": True,
++            "dm": {
++                "policy": "allowlist",
++                "allowFrom": ["@jaden:matrix.example.com"],
++            },
++            "groupPolicy": "allowlist",
++            "groupAllowFrom": ["@jaden:matrix.example.com"],
++            "groups": {"*": {"requireMention": True}},
++            "autoJoin": "always",
++        }
++    },
++    "runtime": {
++        "droid": {
++            "model": "claude-sonnet-4-6",
++            "specModel": "claude-haiku-4-5",
++            "reasoningEffort": "high",
++            "autoLevel": "high",
++            "useSpec": True,
++            "mission": True,
++            "workerModel": "claude-sonnet-4-6",
++            "validatorModel": "claude-opus-4-7",
++            "appendSystemPromptFile": "/tmp/SOUL.md",
++            "enabledTools": ["ApplyPatch", "Bash"],
++            "disabledTools": ["execute-cli"],
++            "tags": ["hiclaw", "manager", "test"],
++            "logGroupId": "hiclaw-manager-test",
++            "cwd": "/tmp/manager",
++            "sessionDir": "/tmp/sessions",
++            "skipPermissionsUnsafe": False,
++        }
++    },
++}
++
++
++def test_matrix_settings_from_openclaw():
++    m = MatrixSettings.from_openclaw(SAMPLE)
++    assert m.homeserver == "https://matrix.example.com"
++    assert m.access_token == "syt_token_xxx"
++    assert m.user_id == "@manager:matrix.example.com"
++    assert m.encryption is True
++    assert m.dm_policy == "allowlist"
++    assert "@jaden:matrix.example.com" in m.allow_from
++    assert m.groups["*"]["requireMention"] is True
++
++
++def test_droid_config_from_openclaw_full():
++    d = DroidConfig.from_openclaw(SAMPLE)
++    assert d.model == "claude-sonnet-4-6"
++    assert d.auto_level == "high"
++    assert d.use_spec is True
++    assert d.mission is True
++    assert "ApplyPatch" in d.enabled_tools
++    assert "execute-cli" in d.disabled_tools
++    assert d.tags == ["hiclaw", "manager", "test"]
++    assert str(d.cwd) == "/tmp/manager"
++    assert str(d.session_dir) == "/tmp/sessions"
++
++
++def test_droid_config_defaults_when_block_missing():
++    """A bare openclaw.json with no runtime block must still produce a config."""
++    d = DroidConfig.from_openclaw({"channels": {"matrix": {}}})
++    assert d.auto_level in {"low", "medium", "high"}
++    assert d.reasoning_effort
++    assert d.binary == "droid"
++    assert d.session_dir is not None
++
++
++def test_build_argv_includes_required_flags():
++    d = DroidConfig.from_openclaw(SAMPLE)
++    argv = d.build_argv()
++    assert argv[0] == d.binary
++    assert argv[1] == "exec"
++    # stream-jsonrpc is the protocol the harness expects
++    assert "--input-format" in argv
++    assert "stream-jsonrpc" in argv
++    assert "--output-format" in argv
++    assert "--auto" in argv
++    assert "high" in argv
++    assert "-m" in argv
++    assert "claude-sonnet-4-6" in argv
++    assert "--mission" in argv
++    assert "--use-spec" in argv
++    assert "--tag" in argv
++    assert "--enabled-tools" in argv
++    assert "ApplyPatch,Bash" in argv
++    assert "--cwd" in argv
++
++
++def test_build_argv_omits_optional_flags():
++    d = DroidConfig.from_openclaw({"channels": {"matrix": {}}})
++    argv = d.build_argv()
++    # No mission / use_spec / append_system_prompt
++    assert "--mission" not in argv
++    assert "--use-spec" not in argv
++    # Default auto level is medium
++    assert "medium" in argv
++
++
++def test_runtime_config_load(tmp_path: Path):
++    p = tmp_path / "openclaw.json"
++    p.write_text(json.dumps(SAMPLE), encoding="utf-8")
++    cfg = RuntimeConfig.load(p)
++    assert cfg.matrix.homeserver == "https://matrix.example.com"
++    assert cfg.droid.model == "claude-sonnet-4-6"
++
++
++def test_runtime_config_load_missing(tmp_path: Path):
++    with pytest.raises(FileNotFoundError):
++        RuntimeConfig.load(tmp_path / "no.json")
++
++
++def test_env_overrides(monkeypatch):
++    monkeypatch.setenv("HICLAW_DROID_MODEL", "gpt-5.4")
++    monkeypatch.setenv("HICLAW_DROID_AUTO", "low")
++    d = DroidConfig.from_openclaw({"channels": {"matrix": {}}})
++    assert d.model == "gpt-5.4"
++    assert d.auto_level == "low"
+diff --git a/droid-manager/tests/test_harness.py b/droid-manager/tests/test_harness.py
+new file mode 100644
+index 0000000..09cf0c4
+--- /dev/null
++++ b/droid-manager/tests/test_harness.py
+@@ -0,0 +1,138 @@
++"""Unit tests for :mod:`droid_manager.harness`.
++
++These tests use a stub binary that speaks the documented JSON-RPC protocol
++over stdin/stdout, so we exercise the harness without depending on the
++real ``droid`` CLI.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import stat
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from droid_manager.config import DroidConfig
++from droid_manager.harness import DroidHarness
++
++
++def _write_stub(tmp_path: Path, body: str) -> Path:
++    stub = tmp_path / "droid"
++    script = "#!/usr/bin/env python3\n" + body
++    stub.write_text(script, encoding="utf-8")
++    stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
++    return stub
++
++
++@pytest.mark.asyncio
++async def test_initialize_session_returns_id(tmp_path: Path):
++    stub = _write_stub(
++        tmp_path,
++        textwrap.dedent(
++            """
++            import json, sys
++            for line in sys.stdin:
++                req = json.loads(line)
++                if req.get("method") == "droid.initialize_session":
++                    resp = {"jsonrpc": "2.0", "id": req["id"], "result": {"session_id": "test-session-42"}}
++                    sys.stdout.write(json.dumps(resp) + "\\n")
++                    sys.stdout.flush()
++            """
++        ),
++    )
++    cfg = DroidConfig(binary=str(stub), cwd=tmp_path)
++    async with DroidHarness(cfg) as harness:
++        sid = await harness.initialize_session(name="test")
++        assert sid == "test-session-42"
++
++
++@pytest.mark.asyncio
++async def test_add_user_message_streams_until_turn_complete(tmp_path: Path):
++    stub = _write_stub(
++        tmp_path,
++        textwrap.dedent(
++            """
++            import json, sys
++            for line in sys.stdin:
++                req = json.loads(line)
++                m = req.get("method")
++                if m == "droid.initialize_session":
++                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"session_id": "s1"}}) + "\\n")
++                    sys.stdout.flush()
++                elif m == "droid.add_user_message":
++                    # Emit a sequence of notifications, then ack the request.
++                    notes = [
++                        {"jsonrpc": "2.0", "method": "droid.session_notification", "params": {"session_id": "s1", "type": "text_delta", "delta": "hello "}},
++                        {"jsonrpc": "2.0", "method": "droid.session_notification", "params": {"session_id": "s1", "type": "text_delta", "delta": "world"}},
++                        {"jsonrpc": "2.0", "method": "droid.session_notification", "params": {"session_id": "s1", "type": "text_complete", "text": "hello world"}},
++                        {"jsonrpc": "2.0", "method": "droid.session_notification", "params": {"session_id": "s1", "type": "turn_complete"}},
++                    ]
++                    for n in notes:
++                        sys.stdout.write(json.dumps(n) + "\\n")
++                        sys.stdout.flush()
++                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {}}) + "\\n")
++                    sys.stdout.flush()
++            """
++        ),
++    )
++    cfg = DroidConfig(binary=str(stub), cwd=tmp_path)
++    async with DroidHarness(cfg) as harness:
++        sid = await harness.initialize_session(name="test")
++        events = []
++        async for ev in harness.add_user_message_stream(text="hi", session_id=sid):
++            events.append(ev)
++        kinds = [e.kind for e in events]
++        assert "text_delta" in kinds
++        assert "text_complete" in kinds
++        assert kinds[-1] == "turn_complete"
++        completed = [e for e in events if e.kind == "text_complete"]
++        assert completed[0].content == "hello world"
++
++
++@pytest.mark.asyncio
++async def test_permission_request_is_resolved(tmp_path: Path):
++    stub = _write_stub(
++        tmp_path,
++        textwrap.dedent(
++            """
++            import json, sys
++            # Send a server->client permission request, then wait for the response.
++            req_id = "perm-1"
++            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": "droid.request_permission", "params": {"tool": "Bash", "description": "rm -rf /"}}) + "\\n")
++            sys.stdout.flush()
++            for line in sys.stdin:
++                msg = json.loads(line)
++                if msg.get("id") == req_id:
++                    sys.stdout.write(json.dumps({"resolved": msg.get("result")}) + "\\n")
++                    sys.stdout.flush()
++                    break
++            """
++        ),
++    )
++
++    resolutions = []
++
++    async def resolver(params):
++        resolutions.append(params)
++        return {"granted": True, "reason": "test"}
++
++    cfg = DroidConfig(binary=str(stub), cwd=tmp_path)
++    harness = DroidHarness(cfg, permission_resolver=resolver)
++    await harness.start()
++    # Give the stub a beat to emit and read.
++    await asyncio.sleep(0.5)
++    await harness.stop()
++    assert resolutions, "permission resolver was not invoked"
++    assert resolutions[0]["tool"] == "Bash"
++
++
++@pytest.mark.asyncio
++async def test_missing_binary_raises(tmp_path: Path):
++    cfg = DroidConfig(binary="droid-does-not-exist-xyz", cwd=tmp_path)
++    harness = DroidHarness(cfg)
++    with pytest.raises(FileNotFoundError):
++        await harness.start()
+diff --git a/droid-manager/tests/test_session_store.py b/droid-manager/tests/test_session_store.py
+new file mode 100644
+index 0000000..245837b
+--- /dev/null
++++ b/droid-manager/tests/test_session_store.py
+@@ -0,0 +1,62 @@
++"""Unit tests for :mod:`droid_manager.session_store`."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from droid_manager.session_store import SessionRecord, SessionStore
++
++
++def test_put_and_get(tmp_path: Path):
++    store = SessionStore(tmp_path)
++    rec = SessionRecord(
++        room_id="!abc:matrix.example.com",
++        session_id="droid-session-uuid-1",
++        kind="dm",
++    )
++    store.put(rec)
++    got = store.get("!abc:matrix.example.com")
++    assert got is not None
++    assert got.session_id == "droid-session-uuid-1"
++    assert got.kind == "dm"
++
++
++def test_get_unknown_returns_none(tmp_path: Path):
++    store = SessionStore(tmp_path)
++    assert store.get("!missing:matrix") is None
++
++
++def test_touch_updates_last_used(tmp_path: Path):
++    store = SessionStore(tmp_path)
++    store.put(SessionRecord(room_id="!r:hs", session_id="sid"))
++    before = store.get("!r:hs")
++    assert before is not None
++    store.touch("!r:hs")
++    after = store.get("!r:hs")
++    assert after is not None
++    assert after.last_used_at >= before.last_used_at
++
++
++def test_delete(tmp_path: Path):
++    store = SessionStore(tmp_path)
++    store.put(SessionRecord(room_id="!r:hs", session_id="sid"))
++    store.delete("!r:hs")
++    assert store.get("!r:hs") is None
++
++
++def test_filename_sanitization(tmp_path: Path):
++    """Room IDs with ``!`` / ``:`` / ``$`` must round-trip without filesystem errors."""
++    store = SessionStore(tmp_path)
++    weird = "!complex/room:host.with.dots:8080"
++    store.put(SessionRecord(room_id=weird, session_id="sid-1"))
++    got = store.get(weird)
++    assert got is not None
++    assert got.session_id == "sid-1"
++
++
++def test_all_lists_existing_records(tmp_path: Path):
++    store = SessionStore(tmp_path)
++    store.put(SessionRecord(room_id="!a:hs", session_id="s1"))
++    store.put(SessionRecord(room_id="!b:hs", session_id="s2", kind="dm"))
++    records = sorted(store.all(), key=lambda r: r.session_id)
++    assert [r.session_id for r in records] == ["s1", "s2"]
+diff --git a/manager/scripts/init/start-manager-agent.sh b/manager/scripts/init/start-manager-agent.sh
+index d42e409..17a1574 100755
+--- a/manager/scripts/init/start-manager-agent.sh
++++ b/manager/scripts/init/start-manager-agent.sh
+@@ -7,7 +7,9 @@
+ # Runtime selection:
+ #   HICLAW_MANAGER_RUNTIME=openclaw (default) - OpenClaw gateway mode
+ #   HICLAW_MANAGER_RUNTIME=copaw              - CoPaw workspace mode
+-# (hermes runtime is supported for Workers only; Managers run openclaw or copaw.)
++#   HICLAW_MANAGER_RUNTIME=droid              - Factory.ai Droid CLI mode
++# (hermes runtime is supported for Workers only; Managers run openclaw, copaw,
++#  or droid.)
+ 
+ source /opt/hiclaw/scripts/lib/hiclaw-env.sh
+ 
+@@ -19,6 +21,9 @@ case "${MANAGER_RUNTIME}" in
+     copaw)
+         log "Manager runtime: CoPaw (Python workspace)"
+         ;;
++    droid)
++        log "Manager runtime: Droid (Factory.ai CLI harness)"
++        ;;
+     *)
+         log "Manager runtime: OpenClaw (Node.js gateway)"
+         MANAGER_RUNTIME="openclaw"
+@@ -1239,6 +1244,12 @@ fi
+ if [ "${MANAGER_RUNTIME}" = "copaw" ]; then
+     # Delegate to CoPaw startup script
+     exec /opt/hiclaw/scripts/init/start-copaw-manager.sh
++elif [ "${MANAGER_RUNTIME}" = "droid" ]; then
++    # Delegate to Droid (Factory.ai CLI) startup script. The droid-manager
++    # package keeps the same openclaw.json contract; only the harness layer
++    # is swapped — the Matrix channel, allowlist, and Manager workspace are
++    # unchanged.
++    exec /opt/hiclaw/scripts/init/start-droid-manager.sh
+ else
+     # ── OpenClaw Runtime ─────────────────────────────────────────────────────
+     log "Starting OpenClaw Manager..."
